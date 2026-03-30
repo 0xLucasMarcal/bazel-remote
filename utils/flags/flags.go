@@ -212,6 +212,11 @@ func GetCliFlags() []cli.Flag {
 			Usage:   "The base URL to use for the experimental grpc proxy backend, e.g. grpc://localhost:9090 or grpcs://example.com:7070. Note that this requires a backend with remote asset API support if you want http client requests to work.",
 			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_URL"},
 		},
+		&cli.StringSliceFlag{
+			Name:    "grpc_proxy.header",
+			Usage:   "Custom header to attach to gRPC proxy backend requests, in key=value format. Can be specified multiple times. Example: --grpc_proxy.header x-buildbuddy-api-key=YOUR_KEY",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_HEADER"},
+		},
 		&cli.StringFlag{
 			Name:    "grpc_proxy.key_file",
 			Value:   "",

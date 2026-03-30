@@ -73,17 +73,26 @@ func (c *Config) setProxy() error {
 		} else {
 			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		}
+		var metadataKVs []string
+
 		if password, ok := c.GRPCBackend.BaseURL.User.Password(); ok {
 			username := c.GRPCBackend.BaseURL.User.Username()
 			auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
-			header := fmt.Sprintf("Basic %s", auth)
-			unaryAuth := func(ctx context.Context, method string, req, res interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-				return invoker(metadata.AppendToOutgoingContext(ctx, "Authorization", header), method, req, res, cc, opts...)
+			metadataKVs = append(metadataKVs, "Authorization", fmt.Sprintf("Basic %s", auth))
+		}
+
+		for k, v := range c.GRPCBackend.Headers {
+			metadataKVs = append(metadataKVs, k, v)
+		}
+
+		if len(metadataKVs) > 0 {
+			unaryMD := func(ctx context.Context, method string, req, res interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				return invoker(metadata.AppendToOutgoingContext(ctx, metadataKVs...), method, req, res, cc, opts...)
 			}
-			streamAuth := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-				return streamer(metadata.AppendToOutgoingContext(ctx, "Authorization", header), desc, cc, method, opts...)
+			streamMD := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+				return streamer(metadata.AppendToOutgoingContext(ctx, metadataKVs...), desc, cc, method, opts...)
 			}
-			opts = append(opts, grpc.WithChainUnaryInterceptor(unaryAuth), grpc.WithStreamInterceptor(streamAuth))
+			opts = append(opts, grpc.WithChainUnaryInterceptor(unaryMD), grpc.WithChainStreamInterceptor(streamMD))
 		}
 
 		metrics := grpc_prometheus.NewClientMetrics(func(o *prom.CounterOpts) { o.Namespace = "proxy" })

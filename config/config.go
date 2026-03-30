@@ -32,10 +32,11 @@ type GoogleCloudStorageConfig struct {
 
 // URLBackendConfig stores the configuration for a HTTP or GRPC proxy backend.
 type URLBackendConfig struct {
-	BaseURL  *url.URL `yaml:"url"`
-	CertFile string   `yaml:"cert_file"`
-	KeyFile  string   `yaml:"key_file"`
-	CaFile   string   `yaml:"ca_file"`
+	BaseURL  *url.URL          `yaml:"url"`
+	CertFile string            `yaml:"cert_file"`
+	KeyFile  string            `yaml:"key_file"`
+	CaFile   string            `yaml:"ca_file"`
+	Headers  map[string]string `yaml:"headers"`
 }
 
 type LDAPConfig struct {
@@ -51,7 +52,8 @@ type LDAPConfig struct {
 func (c *URLBackendConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type Aux URLBackendConfig
 	aux := &struct {
-		URLStr string `yaml:"url"`
+		URLStr  string            `yaml:"url"`
+		Headers map[string]string `yaml:"headers"`
 		*Aux
 	}{
 		Aux: (*Aux)(c),
@@ -65,6 +67,7 @@ func (c *URLBackendConfig) UnmarshalYAML(unmarshal func(interface{}) error) erro
 		return err
 	}
 	c.BaseURL = u
+	c.Headers = aux.Headers
 	return nil
 }
 
@@ -597,11 +600,21 @@ func get(ctx *cli.Context) (*Config, error) {
 			return nil, err
 		}
 
+		headers := make(map[string]string)
+		for _, h := range ctx.StringSlice("grpc_proxy.header") {
+			k, v, ok := strings.Cut(h, "=")
+			if !ok {
+				return nil, fmt.Errorf("invalid grpc_proxy.header value %q: expected key=value format", h)
+			}
+			headers[k] = v
+		}
+
 		grpcb = &URLBackendConfig{
 			BaseURL:  u,
 			KeyFile:  ctx.String("grpc_proxy.key_file"),
 			CertFile: ctx.String("grpc_proxy.cert_file"),
 			CaFile:   ctx.String("grpc_proxy.ca_file"),
+			Headers:  headers,
 		}
 	}
 

@@ -36,7 +36,17 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["config_test.go"],
+    srcs = [
+        "config_test.go",
+        "proxy_test.go",
+    ],
     embed = [":go_default_library"],
-    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
+    deps = [
+        "//genproto/build/bazel/remote/execution/v2:go_default_library",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//credentials/insecure:go_default_library",
+        "@org_golang_google_grpc//metadata:go_default_library",
+        "@org_golang_google_grpc//test/bufconn:go_default_library",
+    ],
 )

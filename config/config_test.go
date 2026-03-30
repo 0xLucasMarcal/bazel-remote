@@ -154,6 +154,95 @@ http_proxy:
 	}
 }
 
+func TestValidGRPCProxyConfig(t *testing.T) {
+	yaml := `host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+grpc_proxy:
+  url: grpcs://buildbuddy.example.com:443
+`
+	config, err := NewFromYaml([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := url.Parse("grpcs://buildbuddy.example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedConfig := &Config{
+		HTTPAddress:        "localhost:8080",
+		Dir:                "/opt/cache-dir",
+		MaxSize:            100,
+		StorageMode:        "zstd",
+		ZstdImplementation: "go",
+		GRPCBackend: &URLBackendConfig{
+			BaseURL: u,
+		},
+		NumUploaders:           100,
+		MinTLSVersion:          "1.0",
+		MaxQueuedUploads:       1000000,
+		MaxBlobSize:            math.MaxInt64,
+		MaxProxyBlobSize:       math.MaxInt64,
+		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		AccessLogLevel:         "all",
+		LogTimezone:            "UTC",
+	}
+
+	if !cmp.Equal(config, expectedConfig) {
+		t.Fatalf("Expected '%+v' but got '%+v'", expectedConfig, config)
+	}
+}
+
+func TestValidGRPCProxyConfigWithHeaders(t *testing.T) {
+	yaml := `host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+grpc_proxy:
+  url: grpcs://buildbuddy.example.com:443
+  headers:
+    x-buildbuddy-api-key: test-api-key
+    x-custom-header: custom-value
+`
+	config, err := NewFromYaml([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := url.Parse("grpcs://buildbuddy.example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedConfig := &Config{
+		HTTPAddress:        "localhost:8080",
+		Dir:                "/opt/cache-dir",
+		MaxSize:            100,
+		StorageMode:        "zstd",
+		ZstdImplementation: "go",
+		GRPCBackend: &URLBackendConfig{
+			BaseURL: u,
+			Headers: map[string]string{
+				"x-buildbuddy-api-key": "test-api-key",
+				"x-custom-header":      "custom-value",
+			},
+		},
+		NumUploaders:           100,
+		MinTLSVersion:          "1.0",
+		MaxQueuedUploads:       1000000,
+		MaxBlobSize:            math.MaxInt64,
+		MaxProxyBlobSize:       math.MaxInt64,
+		MetricsDurationBuckets: []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320},
+		AccessLogLevel:         "all",
+		LogTimezone:            "UTC",
+	}
+
+	if diff := cmp.Diff(expectedConfig, config); diff != "" {
+		t.Fatalf("Config mismatch (-expected +actual):\n%s", diff)
+	}
+}
+
 func TestDirRequired(t *testing.T) {
 	testConfig := &Config{
 		HTTPAddress: "localhost:8080",
