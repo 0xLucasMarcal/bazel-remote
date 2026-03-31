@@ -71,6 +71,7 @@ require (
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/tools v0.40.0 // indirect
+	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
 go 1.24.0

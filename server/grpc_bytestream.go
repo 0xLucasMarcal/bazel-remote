@@ -13,7 +13,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
 	syncpool "github.com/mostynb/zstdpool-syncpool"
@@ -178,19 +180,36 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 }
 
+// extractDigestFunction parses an optional "digest_function/{name}" prefix
+// from the resource name fields and returns the digest function value and the
+// remaining fields after the prefix (or the original fields if no prefix was found).
+func extractDigestFunction(fields []string) (pb.DigestFunction_Value, []string) {
+	for i := range fields {
+		if fields[i] == "digest_function" && i+1 < len(fields) {
+			fnName := strings.ToUpper(fields[i+1])
+			if val, ok := pb.DigestFunction_Value_value[fnName]; ok {
+				return pb.DigestFunction_Value(val), append(fields[:i], fields[i+2:]...)
+			}
+		}
+	}
+	return pb.DigestFunction_SHA256, fields
+}
+
 // Parse a ReadRequest.ResourceName, return the validated hash, size, compression type and an error.
 func (s *grpcServer) parseReadResource(name string, errorPrefix string) (string, int64, casblob.CompressionType, error) {
 
 	// The resource name should be of the format:
-	// [{instance_name}]/blobs/{hash}/{size}
+	// [{instance_name}/][digest_function/{function}/]blobs/{hash}/{size}
 	// Or:
-	// [{instance_name}]/compressed-blobs/{compressor}/{uncompressed_hash}/{uncompressed_size}
+	// [{instance_name}/][digest_function/{function}/]compressed-blobs/{compressor}/{uncompressed_hash}/{uncompressed_size}
 
 	// Instance_name is ignored in this bytestream implementation, so don't
 	// bother returning it. It is not allowed to contain "blobs" as a distinct
 	// path segment.
 
 	fields := strings.Split(name, "/")
+	_, fields = extractDigestFunction(fields)
+
 	var rem []string
 	foundBlobs := false
 	foundCompressedBlobs := false
@@ -280,15 +299,17 @@ func (s *grpcServer) parseReadResource(name string, errorPrefix string) (string,
 }
 
 // Parse a WriteRequest.ResourceName, return the validated hash, size,
-// compression type and an optional error.
-func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.CompressionType, error) {
+// compression type, digest function and an optional error.
+func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.CompressionType, pb.DigestFunction_Value, error) {
 
 	// req.ResourceName is of the form:
-	// [{instance_name}/]uploads/{uuid}/blobs/{hash}/{size}[/{optionalmetadata}]
+	// [{instance_name}/][digest_function/{function}/]uploads/{uuid}/blobs/{hash}/{size}[/{optionalmetadata}]
 	// Or, for compressed blobs:
-	// [{instance_name}/]uploads/{uuid}/compressed-blobs/{compressor}/{uncompressed_hash}/{uncompressed_size}[{/optional_metadata}]
+	// [{instance_name}/][digest_function/{function}/]uploads/{uuid}/compressed-blobs/{compressor}/{uncompressed_hash}/{uncompressed_size}[{/optional_metadata}]
 
 	fields := strings.Split(r, "/")
+	digestFunc, fields := extractDigestFunction(fields)
+
 	var rem []string
 	for i := range fields {
 		if fields[i] == "uploads" {
@@ -298,7 +319,7 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 	}
 
 	if len(rem) < 4 {
-		return "", 0, casblob.Identity,
+		return "", 0, casblob.Identity, digestFunc,
 			status.Errorf(codes.InvalidArgument, "Unable to parse resource name: %s", r)
 	}
 
@@ -308,25 +329,25 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 		hash := rem[2]
 		size, err := strconv.ParseInt(rem[3], 10, 64)
 		if err != nil {
-			return "", 0, casblob.Identity,
+			return "", 0, casblob.Identity, digestFunc,
 				status.Errorf(codes.InvalidArgument, "Unable to parse size: %s from %q", rem[3], r)
 		}
 
 		if size < 0 {
-			return "", 0, casblob.Identity,
+			return "", 0, casblob.Identity, digestFunc,
 				status.Errorf(codes.InvalidArgument, "Invalid size (must be non-negative): %d from %q", size, r)
 		}
 
-		err = s.validateHash(hash, size, "GRPC BYTESTREAM READ FAILED")
+		err = s.validateHash(hash, size, "GRPC BYTESTREAM WRITE FAILED")
 		if err != nil {
-			return "", 0, casblob.Identity, err
+			return "", 0, casblob.Identity, digestFunc, err
 		}
 
-		return hash, size, casblob.Identity, nil
+		return hash, size, casblob.Identity, digestFunc, nil
 	}
 
 	if rem[1] != "compressed-blobs" || len(rem) < 5 || rem[2] != "zstd" {
-		return "", 0, casblob.Zstandard,
+		return "", 0, casblob.Zstandard, digestFunc,
 			status.Errorf(codes.InvalidArgument, "Unable to parse resource name: %s", r)
 	}
 
@@ -334,22 +355,22 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 
 	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
-		return "", 0, casblob.Zstandard,
+		return "", 0, casblob.Zstandard, digestFunc,
 			status.Errorf(codes.InvalidArgument, "Unable to parse size: %s from %q", sizeStr, r)
 	}
 
 	if size < 0 {
-		return "", 0, casblob.Zstandard,
+		return "", 0, casblob.Zstandard, digestFunc,
 			status.Errorf(codes.InvalidArgument, "Invalid size (must be non-negative): %d from %q", size, r)
 	}
 
 	hash := rem[3]
-	err = s.validateHash(hash, size, "GRPC BYTESTREAM READ FAILED")
+	err = s.validateHash(hash, size, "GRPC BYTESTREAM WRITE FAILED")
 	if err != nil {
-		return "", 0, casblob.Zstandard, err
+		return "", 0, casblob.Zstandard, digestFunc, err
 	}
 
-	return hash, size, casblob.Zstandard, nil
+	return hash, size, casblob.Zstandard, digestFunc, nil
 }
 
 var errWriteOffset error = errors.New("bytestream writes from non-zero offsets are unsupported")
@@ -401,7 +422,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				close(resourceNameChan)
 
 				var hash string
-				hash, size, cmp, err = s.parseWriteResource(resourceName)
+				var digestFunc pb.DigestFunction_Value
+				hash, size, cmp, digestFunc, err = s.parseWriteResource(resourceName)
 				if err != nil {
 					s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", err)
 					recvResult <- err
@@ -454,7 +476,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 				go func() {
 					defer func() { _ = rc.Close() }()
-					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
+					putCtx := disk.WithDigestFunction(srv.Context(), digestFunc)
+					err := s.cache.Put(putCtx, cache.CAS, hash, size, rc)
 					putResult <- err
 				}()
 
@@ -598,7 +621,7 @@ func (s *grpcServer) QueryWriteStatus(ctx context.Context, req *bytestream.Query
 		return nil, errNilQueryWriteStatusRequest
 	}
 
-	hash, size, _, err := s.parseWriteResource(req.ResourceName)
+	hash, size, _, _, err := s.parseWriteResource(req.ResourceName)
 	if err != nil {
 		return nil, err
 	}

@@ -32,6 +32,7 @@ import (
 const (
 	hashKeyLength = 64
 	emptySha256   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	emptyBlake3   = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9b68e80b760f08"
 )
 
 const grpcHealthServiceName = "/grpc.health.v1.Health/Check"
@@ -113,7 +114,7 @@ func (s *grpcServer) GetCapabilities(ctx context.Context,
 
 	resp := pb.ServerCapabilities{
 		CacheCapabilities: &pb.CacheCapabilities{
-			DigestFunctions: []pb.DigestFunction_Value{pb.DigestFunction_SHA256},
+			DigestFunctions: []pb.DigestFunction_Value{pb.DigestFunction_SHA256, pb.DigestFunction_BLAKE3},
 			ActionCacheUpdateCapabilities: &pb.ActionCacheUpdateCapabilities{
 				UpdateEnabled: true,
 			},
@@ -145,11 +146,11 @@ func (s *grpcServer) GetCapabilities(ctx context.Context,
 // Return an error if `hash` is not a valid cache key.
 func (s *grpcServer) validateHash(hash string, size int64, logPrefix string) error {
 	if size == int64(0) {
-		if hash == emptySha256 {
+		if hash == emptySha256 || hash == emptyBlake3 {
 			return nil
 		}
 
-		msg := "Invalid zero-length SHA256 hash"
+		msg := "Invalid zero-length hash (expected SHA256 or BLAKE3 empty hash)"
 		s.accessLogger.Printf("%s %s: %s", logPrefix, hash, msg)
 		return status.Error(codes.InvalidArgument, msg)
 	}
