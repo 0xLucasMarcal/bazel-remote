@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"hash"
 	"io"
 
 	"google.golang.org/genproto/googleapis/rpc/code"
@@ -15,19 +14,11 @@ import (
 	grpc_status "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	"lukechampine.com/blake3"
-
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/cache/disk"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
 )
-
-// blake3Hasher returns a new hash.Hash computing BLAKE3 with a 32-byte output.
-func blake3Hasher() hash.Hash {
-	return blake3.New(32, nil)
-}
 
 var (
 	errBadSize      = errors.New("unexpected size")
@@ -130,8 +121,7 @@ func (s *grpcServer) BatchUpdateBlobs(ctx context.Context,
 			}
 		}
 
-		putCtx := disk.WithDigestFunction(ctx, in.DigestFunction)
-		err = s.cache.Put(putCtx, cache.CAS, req.Digest.Hash,
+		err = s.cache.Put(ctx, cache.CAS, req.Digest.Hash,
 			int64(len(req.Data)), bytes.NewReader(req.Data))
 		if err != nil && err != io.EOF {
 			s.logErrorPrintf(err, "%s %s %s", errorPrefix, req.Digest.Hash, err)
@@ -395,12 +385,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			"SpliceBlob called with nil SpliceBlobRequest")
 	}
 
-	supportedDigestFuncs := map[pb.DigestFunction_Value]bool{
-		pb.DigestFunction_UNKNOWN: true,
-		pb.DigestFunction_SHA256:  true,
-		pb.DigestFunction_BLAKE3:  true,
-	}
-	if !supportedDigestFuncs[req.DigestFunction] {
+	if req.DigestFunction != pb.DigestFunction_UNKNOWN && req.DigestFunction != pb.DigestFunction_SHA256 {
 		digestName, ok := pb.DigestFunction_Value_name[int32(req.DigestFunction)]
 		if ok {
 			return nil, grpc_status.Errorf(codes.InvalidArgument,
@@ -411,7 +396,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			"SpliceBlob called with unrecognised digest function: %d", req.DigestFunction)
 	}
 
-	// From this point, verify digests using the negotiated digest function.
+	// From this point, we assume that the digest function is SHA256 and verify digests as necessary.
 
 	// Check that req.ChunkDigests is OK.
 
@@ -464,17 +449,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 
 		checkBlobDigestHashMatchesRegex = false // No need to check, if we hash ourselves
 
-		var hasher io.Writer
-		var sumFn func() string
-		if req.DigestFunction == pb.DigestFunction_BLAKE3 {
-			h := blake3Hasher()
-			hasher = h
-			sumFn = func() string { return hex.EncodeToString(h.Sum(nil)) }
-		} else {
-			h := sha256.New()
-			hasher = h
-			sumFn = func() string { return hex.EncodeToString(h.Sum(nil)) }
-		}
+		hasher := sha256.New()
 
 		for _, chunkDigest := range req.ChunkDigests {
 			rc, _, err := s.cache.Get(ctx, cache.CAS, chunkDigest.Hash, chunkDigest.SizeBytes, 0)
@@ -516,7 +491,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 		}
 
 		req.BlobDigest = &pb.Digest{
-			Hash:      sumFn(),
+			Hash:      hex.EncodeToString(hasher.Sum(nil)),
 			SizeBytes: chunkTotal,
 		}
 	}
@@ -611,8 +586,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 		writerResultChan <- nil
 	}()
 
-	putCtx := disk.WithDigestFunction(ctx, req.DigestFunction)
-	err := s.cache.Put(putCtx, cache.CAS, req.BlobDigest.Hash, req.BlobDigest.SizeBytes, pr)
+	err := s.cache.Put(ctx, cache.CAS, req.BlobDigest.Hash, req.BlobDigest.SizeBytes, pr)
 	if err != nil {
 
 		select {

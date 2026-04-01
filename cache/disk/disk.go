@@ -20,7 +20,6 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/annotate"
-	"github.com/buchgr/bazel-remote/v2/utils/blake3verifier"
 	"github.com/buchgr/bazel-remote/v2/utils/sha256verifier"
 	"github.com/buchgr/bazel-remote/v2/utils/tempfile"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
@@ -95,21 +94,6 @@ type diskCache struct {
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
 const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-const emptyBlake3 = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9b68e80b760f08"
-
-type digestFuncKey struct{}
-
-// WithDigestFunction returns a context carrying the digest function to use for verification.
-func WithDigestFunction(ctx context.Context, fn pb.DigestFunction_Value) context.Context {
-	return context.WithValue(ctx, digestFuncKey{}, fn)
-}
-
-func digestFunctionFromContext(ctx context.Context) pb.DigestFunction_Value {
-	if fn, ok := ctx.Value(digestFuncKey{}).(pb.DigestFunction_Value); ok {
-		return fn
-	}
-	return pb.DigestFunction_SHA256
-}
 
 func internalErr(err error) *cache.Error {
 	return &cache.Error{
@@ -271,7 +255,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
-	if kind == cache.CAS && size == 0 && (hash == emptySha256 || hash == emptyBlake3) {
+	if kind == cache.CAS && size == 0 && hash == emptySha256 {
 		return nil
 	}
 
@@ -399,11 +383,7 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 
 	var writeCloser io.WriteCloser = f
 	if kind == cache.CAS { // c.storageMode == casblob.Identity
-		if digestFunctionFromContext(ctx) == pb.DigestFunction_BLAKE3 {
-			writeCloser = blake3verifier.New(hash, size, f)
-		} else {
-			writeCloser = sha256verifier.New(hash, size, f)
-		}
+		writeCloser = sha256verifier.New(hash, size, f)
 	}
 
 	sizeOnDisk, err = io.Copy(writeCloser, r)
