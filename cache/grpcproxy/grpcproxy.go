@@ -166,17 +166,20 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 		resourceName := fmt.Sprintf(template, uuid.New().String(), item.Hash, item.LogicalSize)
 
 		firstIteration := true
+		var writeOffset int64
 		for {
-			n, err := item.Rc.Read(buf)
-			if err != nil && err != io.EOF {
-				logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
+			n, readErr := item.Rc.Read(buf)
+			if readErr != nil && readErr != io.EOF {
+				logResponse(r.errorLogger, "Write", readErr.Error(), item.Kind, item.Hash)
 				err := stream.CloseSend()
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 				}
 				return
 			}
-			if n > 0 {
+			finished := readErr == io.EOF
+
+			if n > 0 || finished {
 				rn := ""
 				if firstIteration {
 					firstIteration = false
@@ -184,14 +187,21 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 				}
 				req := &bs.WriteRequest{
 					ResourceName: rn,
-					Data:         buf[:n],
+					WriteOffset:  writeOffset,
+					FinishWrite:  finished,
+				}
+				if n > 0 {
+					req.Data = buf[:n]
+					writeOffset += int64(n)
 				}
 				err := stream.Send(req)
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 					return
 				}
-			} else {
+			}
+
+			if finished {
 				_, err = stream.CloseAndRecv()
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
@@ -264,9 +274,15 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		// is enabled. We can treat them as AC in this scope
 		fallthrough
 	case cache.AC:
+		digestSize := size
+		if actionDigestSize, ok := cache.ActionDigestSize(ctx); ok && actionDigestSize > 0 {
+			digestSize = actionDigestSize
+		} else if digestSize < 0 {
+			digestSize = 0
+		}
 		digest := pb.Digest{
 			Hash:      hash,
-			SizeBytes: -1,
+			SizeBytes: digestSize,
 		}
 
 		req := &pb.GetActionResultRequest{ActionDigest: &digest}

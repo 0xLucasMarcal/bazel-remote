@@ -70,6 +70,8 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	// checked by the the disk cache.
 	const unknownActionResultSize = -1
 
+	ctx = cache.WithActionDigestSize(ctx, req.ActionDigest.SizeBytes)
+
 	if !s.depsCheck {
 		logPrefix = "GRPC AC GET NODEPSCHECK"
 

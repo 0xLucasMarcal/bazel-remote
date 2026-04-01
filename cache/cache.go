@@ -7,6 +7,23 @@ import (
 	"io"
 )
 
+type contextKey string
+
+const actionDigestSizeKey contextKey = "actionDigestSize"
+
+// WithActionDigestSize attaches the original Action digest's SizeBytes to the
+// context so that downstream proxy implementations can reconstruct a valid
+// Digest for GetActionResult requests.
+func WithActionDigestSize(ctx context.Context, size int64) context.Context {
+	return context.WithValue(ctx, actionDigestSizeKey, size)
+}
+
+// ActionDigestSize retrieves the Action digest SizeBytes from the context.
+func ActionDigestSize(ctx context.Context) (int64, bool) {
+	size, ok := ctx.Value(actionDigestSizeKey).(int64)
+	return size, ok
+}
+
 // EntryKind describes the kind of cache entry
 type EntryKind int
 
