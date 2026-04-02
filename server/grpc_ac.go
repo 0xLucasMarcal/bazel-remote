@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -56,6 +55,8 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	if req.ActionDigest == nil {
 		return nil, errNilActionDigest
 	}
+
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(req.DigestFunction))
 
 	if s.mangleACKeys {
 		req.ActionDigest.Hash = cache.TransformActionCacheKey(req.ActionDigest.Hash, req.InstanceName, s.accessLogger)
@@ -174,9 +175,10 @@ func (s *grpcServer) maybeInline(ctx context.Context, inline bool, slice *[]byte
 		}
 
 		if *digest == nil {
-			hash := sha256.Sum256(*slice)
+			h := cache.NewHashForFunction(cache.DigestFunctionFromContext(ctx))
+			h.Write(*slice)
 			*digest = &pb.Digest{
-				Hash:      hex.EncodeToString(hash[:]),
+				Hash:      hex.EncodeToString(h.Sum(nil)),
 				SizeBytes: int64(len(*slice)),
 			}
 		}
@@ -235,6 +237,8 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		return nil, errNilActionDigest
 	}
 
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(req.DigestFunction))
+
 	if s.mangleACKeys {
 		req.ActionDigest.Hash = cache.TransformActionCacheKey(req.ActionDigest.Hash, req.InstanceName, s.accessLogger)
 	}
@@ -282,9 +286,10 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		if f != nil && len(f.Contents) > 0 {
 
 			if f.Digest == nil {
-				hashData := sha256.Sum256(f.Contents)
+				h := cache.NewHashForFunction(cache.DigestFunctionFromContext(ctx))
+				h.Write(f.Contents)
 				f.Digest = &pb.Digest{
-					Hash:      hex.EncodeToString(hashData[:]),
+					Hash:      hex.EncodeToString(h.Sum(nil)),
 					SizeBytes: int64(len(f.Contents)),
 				}
 			}
@@ -307,8 +312,9 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 			hash = req.ActionResult.StdoutDigest.Hash
 			sizeBytes = req.ActionResult.StdoutDigest.SizeBytes
 		} else {
-			hashData := sha256.Sum256(req.ActionResult.StdoutRaw)
-			hash = hex.EncodeToString(hashData[:])
+			h := cache.NewHashForFunction(cache.DigestFunctionFromContext(ctx))
+			h.Write(req.ActionResult.StdoutRaw)
+			hash = hex.EncodeToString(h.Sum(nil))
 			sizeBytes = int64(len(req.ActionResult.StdoutRaw))
 		}
 
@@ -329,8 +335,9 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 			hash = req.ActionResult.StderrDigest.Hash
 			sizeBytes = req.ActionResult.StderrDigest.SizeBytes
 		} else {
-			hashData := sha256.Sum256(req.ActionResult.StderrRaw)
-			hash = hex.EncodeToString(hashData[:])
+			h := cache.NewHashForFunction(cache.DigestFunctionFromContext(ctx))
+			h.Write(req.ActionResult.StderrRaw)
+			hash = hex.EncodeToString(h.Sum(nil))
 			sizeBytes = int64(len(req.ActionResult.StderrRaw))
 		}
 

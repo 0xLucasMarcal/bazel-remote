@@ -372,8 +372,11 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	var err error
 	var sizeOnDisk int64
 
+	df := cache.DigestFunctionFromContext(ctx)
+	h := cache.NewHashForFunction(df)
+
 	if kind == cache.CAS && c.storageMode != casblob.Identity {
-		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, r, f, c.storageMode, hash, size)
+		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, r, f, c.storageMode, hash, size, h)
 		if err != nil {
 			return -1, annotate.Err(ctx, "Failed to write compressed CAS blob to disk", err)
 		}
@@ -383,7 +386,7 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 
 	var writeCloser io.WriteCloser = f
 	if kind == cache.CAS { // c.storageMode == casblob.Identity
-		writeCloser = sha256verifier.New(hash, size, f)
+		writeCloser = sha256verifier.NewWithHash(hash, size, f, h)
 	}
 
 	sizeOnDisk, err = io.Copy(writeCloser, r)
@@ -708,8 +711,22 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	blobFile = tf.Name()
 
 	var sizeOnDisk int64
-	sizeOnDisk, err = io.Copy(tf, r)
-	_ = tf.Close()
+	if kind == cache.CAS && c.storageMode != casblob.Identity {
+		// The proxy backend may return raw zstd data (REAPI-compliant backends
+		// like BuildBuddy) or casblob-format data (if backend is another
+		// bazel-remote). Decompress and re-encode in proper casblob format
+		// so the local disk cache can always read it back correctly.
+		dec, decErr := c.zstd.GetDecoder(r)
+		if decErr != nil {
+			_ = tf.Close()
+			return nil, -1, internalErr(decErr)
+		}
+		sizeOnDisk, err = c.writeAndCloseFile(ctx, dec, kind, hash, foundSize, tf)
+		_ = dec.Close()
+	} else {
+		sizeOnDisk, err = io.Copy(tf, r)
+		_ = tf.Close()
+	}
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}

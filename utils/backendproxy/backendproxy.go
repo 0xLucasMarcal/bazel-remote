@@ -7,11 +7,12 @@ import (
 )
 
 type UploadReq struct {
-	Hash        string
-	LogicalSize int64
-	SizeOnDisk  int64
-	Kind        cache.EntryKind
-	Rc          io.ReadCloser
+	Hash           string
+	LogicalSize    int64
+	SizeOnDisk     int64
+	Kind           cache.EntryKind
+	Rc             io.ReadCloser
+	DigestFunction cache.DigestFunction
 }
 
 type Uploader interface {

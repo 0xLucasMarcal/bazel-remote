@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -77,7 +78,7 @@ type readCloserWrapper struct {
 	file *os.File
 }
 
-var errWrongMagicNum = errors.New("expected magic number not found")
+var ErrWrongMagicNum = errors.New("expected magic number not found")
 
 // Read the header and leave f at the start of the data.
 func readHeader(f *os.File) (*header, error) {
@@ -101,7 +102,7 @@ func readHeader(f *os.File) (*header, error) {
 		return nil, fmt.Errorf("unable to read magic number: %w", err)
 	}
 	if magicNumber != skippableFrameMagicNumber {
-		return nil, errWrongMagicNum
+		return nil, ErrWrongMagicNum
 	}
 
 	var frameSize uint32
@@ -517,9 +518,10 @@ var chunkBufferPool = &sync.Pool{
 	},
 }
 
-// Read from r and write to f, using CompressionType t.
+// WriteAndClose reads from r and writes to f, using CompressionType t.
+// If hasher is nil, sha256 is used by default.
 // Return the size on disk or an error if something went wrong.
-func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t CompressionType, hash string, size int64) (int64, error) {
+func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t CompressionType, expectedHash string, size int64, hasher ...hash.Hash) (int64, error) {
 	var err error
 	defer func() { _ = f.Close() }()
 
@@ -558,10 +560,17 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 
 	var n int64
 
-	if t == Identity {
-		hasher := sha256.New()
+	newHasher := func() hash.Hash {
+		if len(hasher) > 0 && hasher[0] != nil {
+			return hasher[0]
+		}
+		return sha256.New()
+	}
 
-		n, err = io.Copy(io.MultiWriter(f, hasher), r)
+	if t == Identity {
+		h2 := newHasher()
+
+		n, err = io.Copy(io.MultiWriter(f, h2), r)
 		if err != nil {
 			return -1, err
 		}
@@ -570,11 +579,11 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 				size, n)
 		}
 
-		actualHash := hex.EncodeToString(hasher.Sum(nil))
-		if actualHash != hash {
+		actualHash := hex.EncodeToString(h2.Sum(nil))
+		if actualHash != expectedHash {
 			return -1,
 				fmt.Errorf("checksums don't match. Expected %s, found %s",
-					hash, actualHash)
+					expectedHash, actualHash)
 		}
 
 		return n + fileOffset, f.Close()
@@ -592,7 +601,7 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 	}()
 	uncompressedChunk := *chunkBufferPtr
 
-	hasher := sha256.New()
+	h2 := newHasher()
 
 	for nextChunk < len(h.chunkOffsets)-1 {
 		h.chunkOffsets[nextChunk] = fileOffset
@@ -611,7 +620,7 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 
 		compressedChunk := zstd.EncodeAll(uncompressedChunk[0:chunkEnd])
 
-		hasher.Write(uncompressedChunk[0:chunkEnd])
+		h2.Write(uncompressedChunk[0:chunkEnd])
 
 		written, err := f.Write(compressedChunk)
 		if err != nil {
@@ -630,10 +639,10 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 		return -1, fmt.Errorf("failed to read chunk of size %d: %w", len(uncompressedChunk), err)
 	}
 
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != hash {
+	actualHash := hex.EncodeToString(h2.Sum(nil))
+	if actualHash != expectedHash {
 		return -1, fmt.Errorf("checksums don't match. Expected %s, found %s",
-			hash, actualHash)
+			expectedHash, actualHash)
 	}
 
 	// We know all the chunk offsets now, go back and fill those in.

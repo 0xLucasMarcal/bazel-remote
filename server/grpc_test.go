@@ -2215,7 +2215,7 @@ func TestParseReadResource(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		hash, size, cmp, err := s.parseReadResource(tc.resourceName, unusedLogPrefix)
+		hash, size, cmp, _, err := s.parseReadResource(tc.resourceName, unusedLogPrefix)
 
 		if tc.expectError {
 			if err == nil {
@@ -2420,7 +2420,7 @@ func TestParseWriteResource(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		hash, size, cmp, err := s.parseWriteResource(tc.resourceName)
+		hash, size, cmp, _, err := s.parseWriteResource(tc.resourceName)
 
 		if tc.expectError {
 			if err == nil {

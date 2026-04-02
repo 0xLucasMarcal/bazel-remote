@@ -13,3 +13,4 @@
 /bazel-*
 
 /bazel-remote
+.DS_Store

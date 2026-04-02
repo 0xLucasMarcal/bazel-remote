@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -47,6 +46,8 @@ func (s *grpcServer) FindMissingBlobs(ctx context.Context,
 		return nil, errNilFindMissingBlobsRequest
 	}
 
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(req.DigestFunction))
+
 	errorPrefix := "GRPC CAS HEAD"
 	for _, digest := range req.BlobDigests {
 
@@ -74,6 +75,8 @@ func (s *grpcServer) BatchUpdateBlobs(ctx context.Context,
 	if in == nil {
 		return nil, errNilBatchUpdateBlobsRequest
 	}
+
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(in.DigestFunction))
 
 	resp := pb.BatchUpdateBlobsResponse{
 		Responses: make([]*pb.BatchUpdateBlobsResponse_Response,
@@ -247,6 +250,8 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		return nil, errNilBatchReadBlobsRequest
 	}
 
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(in.DigestFunction))
+
 	resp := pb.BatchReadBlobsResponse{
 		Responses: make([]*pb.BatchReadBlobsResponse_Response,
 			0, len(in.Digests)),
@@ -294,12 +299,14 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 		return errNilDigest
 	}
 
+	ctx := cache.WithDigestFunction(stream.Context(), digestFunctionFromProto(in.DigestFunction))
+
 	err := s.validateHash(in.RootDigest.Hash, in.RootDigest.SizeBytes, errorPrefix)
 	if err != nil {
 		return err
 	}
 
-	data, err := s.getBlobData(stream.Context(), in.RootDigest.Hash, in.RootDigest.SizeBytes)
+	data, err := s.getBlobData(ctx, in.RootDigest.Hash, in.RootDigest.SizeBytes)
 	if err == errBlobNotFound {
 		s.accessLogger.Printf("GRPC CAS GETTREEREQUEST %s NOT FOUND",
 			in.RootDigest.Hash)
@@ -317,7 +324,7 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 		return grpc_status.Error(codes.DataLoss, err.Error())
 	}
 
-	err = s.fillDirectories(stream.Context(), &resp, &dir, errorPrefix)
+	err = s.fillDirectories(ctx, &resp, &dir, errorPrefix)
 	if err != nil {
 		return err
 	}
@@ -385,7 +392,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			"SpliceBlob called with nil SpliceBlobRequest")
 	}
 
-	if req.DigestFunction != pb.DigestFunction_UNKNOWN && req.DigestFunction != pb.DigestFunction_SHA256 {
+	if !isSupportedDigestFunction(req.DigestFunction) {
 		digestName, ok := pb.DigestFunction_Value_name[int32(req.DigestFunction)]
 		if ok {
 			return nil, grpc_status.Errorf(codes.InvalidArgument,
@@ -396,7 +403,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			"SpliceBlob called with unrecognised digest function: %d", req.DigestFunction)
 	}
 
-	// From this point, we assume that the digest function is SHA256 and verify digests as necessary.
+	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(req.DigestFunction))
 
 	// Check that req.ChunkDigests is OK.
 
@@ -417,7 +424,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 				"SpliceBlob called with a negative Digest in SpliceBlobRequest.ChunkDigests")
 		}
 
-		if chunkDigest.SizeBytes == 0 || chunkDigest.Hash == emptySha256 {
+		if chunkDigest.SizeBytes == 0 || chunkDigest.Hash == emptySha256 || chunkDigest.Hash == emptyBlake3 {
 			return nil, grpc_status.Errorf(codes.InvalidArgument,
 				"SpliceBlob called with an empty blob in SpliceBlobRequest.ChunkDigests")
 		}
@@ -449,7 +456,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 
 		checkBlobDigestHashMatchesRegex = false // No need to check, if we hash ourselves
 
-		hasher := sha256.New()
+		hasher := cache.NewHashForFunction(cache.DigestFunctionFromContext(ctx))
 
 		for _, chunkDigest := range req.ChunkDigests {
 			rc, _, err := s.cache.Get(ctx, cache.CAS, chunkDigest.Hash, chunkDigest.SizeBytes, 0)
@@ -504,7 +511,7 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			req.BlobDigest.SizeBytes, s.maxCasBlobSizeBytes)
 	}
 
-	if req.BlobDigest.SizeBytes == 0 || req.BlobDigest.Hash == emptySha256 {
+	if req.BlobDigest.SizeBytes == 0 || req.BlobDigest.Hash == emptySha256 || req.BlobDigest.Hash == emptyBlake3 {
 		return nil, grpc_status.Errorf(codes.InvalidArgument,
 			"SpliceBlob called to create the empty blob?")
 	}

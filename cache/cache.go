@@ -4,12 +4,42 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"hash"
 	"io"
+
+	"github.com/zeebo/blake3"
 )
 
 type contextKey string
 
 const actionDigestSizeKey contextKey = "actionDigestSize"
+const digestFunctionKey contextKey = "digestFunction"
+
+type DigestFunction int
+
+const (
+	DigestFunctionSHA256 DigestFunction = iota
+	DigestFunctionBLAKE3
+)
+
+func WithDigestFunction(ctx context.Context, df DigestFunction) context.Context {
+	return context.WithValue(ctx, digestFunctionKey, df)
+}
+
+func DigestFunctionFromContext(ctx context.Context) DigestFunction {
+	df, ok := ctx.Value(digestFunctionKey).(DigestFunction)
+	if !ok {
+		return DigestFunctionSHA256
+	}
+	return df
+}
+
+func NewHashForFunction(df DigestFunction) hash.Hash {
+	if df == DigestFunctionBLAKE3 {
+		return blake3.New()
+	}
+	return sha256.New()
+}
 
 // WithActionDigestSize attaches the original Action digest's SizeBytes to the
 // context so that downstream proxy implementations can reconstruct a valid

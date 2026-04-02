@@ -31,6 +31,7 @@ require (
 	github.com/go-ldap/ldap/v3 v3.4.12
 	github.com/johannesboyne/gofakes3 v0.0.0-20230506070712-04da935ef877
 	github.com/valyala/gozstd v1.24.0
+	github.com/zeebo/blake3 v0.2.4
 	google.golang.org/genproto/googleapis/api v0.0.0-20260114163908-3f89685c29c3
 	google.golang.org/genproto/googleapis/bytestream v0.0.0-20260114163908-3f89685c29c3
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260114163908-3f89685c29c3

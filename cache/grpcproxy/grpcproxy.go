@@ -81,6 +81,20 @@ type remoteGrpcProxyCache struct {
 	v2mode       bool
 }
 
+func digestFunctionProto(df cache.DigestFunction) pb.DigestFunction_Value {
+	if df == cache.DigestFunctionBLAKE3 {
+		return pb.DigestFunction_BLAKE3
+	}
+	return pb.DigestFunction_SHA256
+}
+
+func digestFunctionSegment(df cache.DigestFunction) string {
+	if df == cache.DigestFunctionBLAKE3 {
+		return "blake3/"
+	}
+	return ""
+}
+
 func New(clients *GrpcClients, storageMode string,
 	accessLogger cache.Logger, errorLogger cache.Logger,
 	numUploaders, maxQueuedUploads int) cache.Proxy {
@@ -138,8 +152,9 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 		}
 
 		req := &pb.UpdateActionResultRequest{
-			ActionDigest: digest,
-			ActionResult: ar,
+			ActionDigest:   digest,
+			ActionResult:   ar,
+			DigestFunction: digestFunctionProto(item.DigestFunction),
 		}
 		_, err = r.clients.ac.UpdateActionResult(context.Background(), req)
 		if err != nil {
@@ -159,11 +174,12 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 		}
 		buf := make([]byte, bufSize)
 
-		template := "uploads/%s/blobs/%s/%d"
+		dfSeg := digestFunctionSegment(item.DigestFunction)
+		template := "uploads/%s/blobs/%s%s/%d"
 		if r.v2mode {
-			template = "uploads/%s/compressed-blobs/zstd/%s/%d"
+			template = "uploads/%s/compressed-blobs/zstd/%s%s/%d"
 		}
-		resourceName := fmt.Sprintf(template, uuid.New().String(), item.Hash, item.LogicalSize)
+		resourceName := fmt.Sprintf(template, uuid.New().String(), dfSeg, item.Hash, item.LogicalSize)
 
 		firstIteration := true
 		var writeOffset int64
@@ -224,11 +240,12 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 	}
 
 	item := backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
+		Hash:           hash,
+		LogicalSize:    logicalSize,
+		SizeOnDisk:     sizeOnDisk,
+		Kind:           kind,
+		Rc:             rc,
+		DigestFunction: cache.DigestFunctionFromContext(ctx),
 	}
 
 	select {
@@ -285,7 +302,10 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			SizeBytes: digestSize,
 		}
 
-		req := &pb.GetActionResultRequest{ActionDigest: &digest}
+		req := &pb.GetActionResultRequest{
+			ActionDigest:   &digest,
+			DigestFunction: digestFunctionProto(cache.DigestFunctionFromContext(ctx)),
+		}
 
 		res, err := r.clients.ac.GetActionResult(ctx, req)
 		status, ok := status.FromError(err)
@@ -317,12 +337,13 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			size = digest.SizeBytes
 		}
 
-		template := "blobs/%s/%d"
+		dfSeg := digestFunctionSegment(cache.DigestFunctionFromContext(ctx))
+		template := "blobs/%s%s/%d"
 		if r.v2mode {
-			template = "compressed-blobs/zstd/%s/%d"
+			template = "compressed-blobs/zstd/%s%s/%d"
 		}
 		req := bs.ReadRequest{
-			ResourceName: fmt.Sprintf(template, hash, size),
+			ResourceName: fmt.Sprintf(template, dfSeg, hash, size),
 		}
 		stream, err := r.clients.bs.Read(ctx, &req)
 		if err != nil {
@@ -365,8 +386,8 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 			return true, digest.SizeBytes
 		}
 
-		// If we know the size, prefer using the remote execution api
 		req := &pb.FindMissingBlobsRequest{
+			DigestFunction: digestFunctionProto(cache.DigestFunctionFromContext(ctx)),
 			BlobDigests: []*pb.Digest{{
 				Hash:      hash,
 				SizeBytes: size,

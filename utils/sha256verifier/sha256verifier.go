@@ -18,13 +18,15 @@ type sha256verifier struct {
 }
 
 func New(expectedHash string, expectedSize int64, writeCloser io.WriteCloser) *sha256verifier {
-	hash := sha256.New()
+	return NewWithHash(expectedHash, expectedSize, writeCloser, sha256.New())
+}
 
+func NewWithHash(expectedHash string, expectedSize int64, writeCloser io.WriteCloser, h hash.Hash) *sha256verifier {
 	return &sha256verifier{
-		Hash:                hash,
+		Hash:                h,
 		expectedHash:        expectedHash,
 		expectedSize:        expectedSize,
-		multiWriter:         io.MultiWriter(hash, writeCloser),
+		multiWriter:         io.MultiWriter(h, writeCloser),
 		originalWriteCloser: writeCloser,
 	}
 }
