@@ -215,6 +215,8 @@ func (s *grpcServer) getBlobResponse(ctx context.Context, digest *pb.Digest, all
 		r.Data = data
 		r.Compressor = pb.Compressor_ZSTD
 
+		s.accessLogger.Printf("GRPC CAS GET %s OK", digest.Hash)
+		r.Status = &status.Status{Code: int32(codes.OK)}
 		return &r
 	}
 

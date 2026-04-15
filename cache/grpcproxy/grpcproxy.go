@@ -350,7 +350,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
 			return nil, -1, err
 		}
-		logResponse(r.errorLogger, "Read", "Completed", kind, hash)
+		logResponse(r.accessLogger, "Read", "Completed", kind, hash)
 		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream}
 		return &rc, size, nil
 	default:
