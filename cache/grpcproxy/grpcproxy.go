@@ -211,6 +211,16 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 					writeOffset += int64(n)
 				}
 				err := stream.Send(req)
+				if err == io.EOF {
+					// Server closed the stream early. The real error (or a
+					// short-circuit success for a blob that already exists)
+					// is in CloseAndRecv.
+					_, recvErr := stream.CloseAndRecv()
+					if recvErr != nil {
+						logResponse(r.errorLogger, "Write", recvErr.Error(), item.Kind, item.Hash)
+					}
+					return
+				}
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 					return
@@ -223,7 +233,6 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 					return
 				}
-				logResponse(r.accessLogger, "Write", "Success", item.Kind, item.Hash)
 				return
 			}
 		}
@@ -323,7 +332,6 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			return nil, -1, err
 		}
 
-		logResponse(r.accessLogger, "Get", "Success", kind, hash)
 		return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 
 	case cache.CAS:
@@ -350,7 +358,6 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
 			return nil, -1, err
 		}
-		logResponse(r.accessLogger, "Read", "Completed", kind, hash)
 		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream}
 		return &rc, size, nil
 	default:
@@ -382,7 +389,6 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 				logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
 				return false, -1
 			}
-			logResponse(r.accessLogger, "Contains", "Success", kind, hash)
 			return true, digest.SizeBytes
 		}
 
@@ -399,10 +405,8 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 			return false, -1
 		}
 		for range res.MissingBlobDigests {
-			logResponse(r.accessLogger, "Contains", "Not Found", kind, hash)
 			return false, -1
 		}
-		logResponse(r.errorLogger, "Contains", "Success", kind, hash)
 		return true, size
 	default:
 		logResponse(r.errorLogger, "Contains", "Unexpected kind", kind, hash)
