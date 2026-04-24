@@ -2,8 +2,6 @@ package flags
 
 import (
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
@@ -182,22 +180,22 @@ func GetCliFlags() []cli.Flag {
 		},
 		&cli.IntFlag{
 			Name:    "max_queued_uploads",
-			Value:   1000000,
-			Usage:   "When using proxy backends, sets the maximum number of objects in queue for upload. If the queue is full, uploads will be skipped until the queue has space again.",
+			Value:   10000,
+			Usage:   "When using proxy backends, sets the maximum number of objects in queue for upload. If the queue is full, uploads will be skipped until the queue has space again. Lowered from the historical 1,000,000 to bound peak memory and file-descriptor use; pass an explicit value if you need the old behaviour.",
 			EnvVars: []string{"BAZEL_REMOTE_MAX_QUEUED_UPLOADS"},
 		},
 		&cli.Int64Flag{
 			Name:        "max_blob_size",
-			Value:       math.MaxInt64,
-			Usage:       "The maximum logical/uncompressed blob size that will be accepted from clients. Note that this limit is not applied to preexisting blobs in the cache.",
-			DefaultText: strconv.FormatInt(math.MaxInt64, 10),
+			Value:       4 * 1024 * 1024 * 1024,
+			Usage:       "The maximum logical/uncompressed blob size that will be accepted from clients. Note that this limit is not applied to preexisting blobs in the cache. Pass math.MaxInt64 (9223372036854775807) to restore the historical 'unlimited' default.",
+			DefaultText: "4 GiB",
 			EnvVars:     []string{"BAZEL_REMOTE_MAX_BLOB_SIZE"},
 		},
 		&cli.Int64Flag{
 			Name:        "max_proxy_blob_size",
-			Value:       math.MaxInt64,
-			Usage:       "The maximum logical/uncompressed blob size that will be downloaded from proxies. Note that this limit is not applied to preexisting blobs in the cache.",
-			DefaultText: strconv.FormatInt(math.MaxInt64, 10),
+			Value:       4 * 1024 * 1024 * 1024,
+			Usage:       "The maximum logical/uncompressed blob size that will be downloaded from proxies. Note that this limit is not applied to preexisting blobs in the cache. Pass math.MaxInt64 (9223372036854775807) to restore the historical 'unlimited' default.",
+			DefaultText: "4 GiB",
 			EnvVars:     []string{"BAZEL_REMOTE_MAX_PROXY_BLOB_SIZE"},
 		},
 		&cli.IntFlag{
@@ -205,6 +203,24 @@ func GetCliFlags() []cli.Flag {
 			Value:   100,
 			Usage:   "When using proxy backends, sets the number of Goroutines to process parallel uploads to backend.",
 			EnvVars: []string{"BAZEL_REMOTE_NUM_UPLOADERS"},
+		},
+		&cli.IntFlag{
+			Name:    "proxy_contains_queue_size",
+			Value:   2048,
+			Usage:   "Size of the per-blob proxy.Contains queue used to look up missing blobs in HTTP/S3/GCS/AZBlob proxy backends. Has no effect for the gRPC proxy backend, which uses a single batched FindMissingBlobs RPC.",
+			EnvVars: []string{"BAZEL_REMOTE_PROXY_CONTAINS_QUEUE_SIZE"},
+		},
+		&cli.IntFlag{
+			Name:    "proxy_contains_workers",
+			Value:   512,
+			Usage:   "Number of worker goroutines that drain the per-blob proxy.Contains queue. Has no effect for the gRPC proxy backend, which uses a single batched FindMissingBlobs RPC.",
+			EnvVars: []string{"BAZEL_REMOTE_PROXY_CONTAINS_WORKERS"},
+		},
+		&cli.IntFlag{
+			Name:    "max_inflight_batch_blobs",
+			Value:   64,
+			Usage:   "Maximum number of concurrent BatchReadBlobs / BatchUpdateBlobs gRPC handlers. Each handler can buffer its blobs in RAM, so this is the primary knob for bounding peak server memory. Increase if you have plenty of RAM and want to serve more parallel batch requests.",
+			EnvVars: []string{"BAZEL_REMOTE_MAX_INFLIGHT_BATCH_BLOBS"},
 		},
 		&cli.StringFlag{
 			Name:    "grpc_proxy.url",

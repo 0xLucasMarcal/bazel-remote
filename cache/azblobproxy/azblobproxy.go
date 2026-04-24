@@ -137,6 +137,10 @@ func (c *azBlobCache) Contains(ctx context.Context, kind cache.EntryKind, hash s
 	return exists, size
 }
 
+func (c *azBlobCache) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
+}
+
 func New(
 	storageAccount string,
 	containerName string,

@@ -269,3 +269,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 
 	return exists, size
 }
+
+func (c *s3Cache) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
+}

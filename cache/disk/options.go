@@ -68,6 +68,28 @@ func WithProxyBackend(proxy cache.Proxy) Option {
 	}
 }
 
+// WithProxyContainsQueue overrides the size of the per-blob proxy.Contains
+// queue and the number of worker goroutines that drain it. Both values
+// must be > 0; zero/negative values keep the defaults
+// (defaultContainsQueueSize / defaultContainsWorkers).
+//
+// This only affects proxies whose FindMissingCasBlobs returns
+// ErrProxyBatchNotImplemented (HTTP/S3/GCS/AZBlob); the gRPC proxy
+// answers FindMissingBlobs in a single batch RPC and never queues here.
+//
+// Must be set before WithProxyBackend, since WithProxyBackend spawns the
+// workers immediately.
+func WithProxyContainsQueue(queueSize, workers int) Option {
+	return func(c *CacheConfig) error {
+		if queueSize < 0 || workers < 0 {
+			return fmt.Errorf("invalid proxy contains queue config: queueSize=%d workers=%d", queueSize, workers)
+		}
+		c.diskCache.containsQueueSize = queueSize
+		c.diskCache.containsWorkers = workers
+		return nil
+	}
+}
+
 func WithProxyMaxBlobSize(maxProxyBlobSize int64) Option {
 	return func(c *CacheConfig) error {
 		if maxProxyBlobSize <= 0 {

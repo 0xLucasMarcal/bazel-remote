@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	auth "github.com/abbot/go-http-auth"
 
@@ -151,6 +152,7 @@ func run(ctx *cli.Context) error {
 		disk.WithProxyMaxBlobSize(c.MaxProxyBlobSize),
 		disk.WithMaxSizeHardLimit(int64(c.MaxSizeHardLimit) * 1024 * 1024 * 1024),
 		disk.WithAccessLogger(c.AccessLogger),
+		disk.WithProxyContainsQueue(c.ProxyContainsQueueSize, c.ProxyContainsWorkers),
 	}
 	if c.ProxyBackend != nil {
 		opts = append(opts, disk.WithProxyBackend(c.ProxyBackend))
@@ -216,9 +218,17 @@ func run(ctx *cli.Context) error {
 	}
 
 	if c.ProfileAddress != "" {
+		// Enable mutex contention and goroutine block profiles so that
+		// /debug/pprof/mutex and /debug/pprof/block return useful data.
+		// These are off by default; enabling them only when pprof is
+		// already exposed keeps the cost bounded to operators that
+		// asked for it.
+		runtime.SetMutexProfileFraction(100)
+		runtime.SetBlockProfileRate(int((10 * time.Microsecond).Nanoseconds()))
+
 		go func() {
 			// Allow access to /debug/pprof/ URLs.
-			log.Printf("Starting HTTP server for profiling on address %s",
+			log.Printf("Starting HTTP server for profiling on address %s (mutex/block profiles enabled)",
 				c.ProfileAddress)
 			log.Fatal(`Failed to listen on address: "`, c.ProfileAddress,
 				`": `, http.ListenAndServe(c.ProfileAddress, nil))
@@ -462,6 +472,7 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		c.EnableACKeyInstanceMangling,
 		enableRemoteAssetAPI,
 		c.MaxBlobSize,
+		c.MaxInflightBatchBlobs,
 		diskCache, c.AccessLogger, c.ErrorLogger)
 }
 

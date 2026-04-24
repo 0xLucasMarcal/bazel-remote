@@ -85,7 +85,7 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 			remaining = remaining[batchSize:]
 		}
 
-		numMissing := c.findMissingLocalCAS(chunk)
+		numMissing := c.findMissingLocalCAS(ctx, chunk)
 		if numMissing == 0 {
 			continue
 		}
@@ -96,6 +96,13 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 		}
 
 		if c.proxy != nil {
+			// Build the list of digests in this chunk that the proxy
+			// should be asked about (i.e. local-misses small enough to
+			// fit under maxProxyBlobSize).
+			var (
+				batch    []cache.Digest
+				batchIdx []int // index into chunk for each batch entry
+			)
 			for i := range chunk {
 				if chunk[i] == nil {
 					continue
@@ -109,25 +116,77 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 					continue
 				}
 
-				// Adding to the containsQueue channel may have blocked on a previous iteration,
-				// so check to see if the context has cancelled.
-				select {
-				case <-ctx.Done():
-					if cancelledDueToFailFast {
+				batch = append(batch, cache.Digest{
+					Hash:      chunk[i].Hash,
+					SizeBytes: chunk[i].SizeBytes,
+				})
+				batchIdx = append(batchIdx, i)
+			}
+
+			if len(batch) > 0 {
+				// Try the single-RPC batch path first. For the gRPC
+				// proxy this collapses N per-blob FindMissingBlobs RPCs
+				// into one. For proxies without native batch support
+				// (HTTP, S3, GCS, AZBlob) FindMissingCasBlobs returns
+				// ErrProxyBatchNotImplemented and we fall back to the
+				// per-blob containsQueue worker pool below.
+				missingFromProxy, err := c.proxy.FindMissingCasBlobs(ctx, batch)
+				switch {
+				case err == nil:
+					stillMissing := make(map[string]struct{}, len(missingFromProxy))
+					for _, d := range missingFromProxy {
+						stillMissing[d.Hash] = struct{}{}
+					}
+					for _, i := range batchIdx {
+						if _, missing := stillMissing[chunk[i].Hash]; missing {
+							c.accessLogger.Printf("GRPC CAS HEAD %s NOT FOUND", chunk[i].Hash)
+							if failFast {
+								return errMissingBlob
+							}
+						} else {
+							c.accessLogger.Printf("GRPC CAS HEAD %s OK", chunk[i].Hash)
+							chunk[i] = nil
+						}
+					}
+				case errors.Is(err, cache.ErrProxyBatchNotImplemented):
+					// Per-blob containsQueue fallback for proxies that
+					// don't support batch FindMissingBlobs.
+					for _, i := range batchIdx {
+						// Adding to the containsQueue channel may have blocked
+						// on a previous iteration, so check to see if the
+						// context has cancelled.
+						select {
+						case <-ctx.Done():
+							if cancelledDueToFailFast {
+								return errMissingBlob
+							}
+							return errRequestCancelled
+						default:
+						}
+
+						wg.Add(1)
+						c.containsQueue <- proxyCheck{
+							wg:     &wg,
+							digest: &chunk[i],
+							ctx:    ctx,
+							// When failFast is true, onProxyMiss will have been set to a function that
+							// will cancel the context, causing the remaining proxyChecks to short-circuit.
+							onProxyMiss: cancelContextForFailFast,
+						}
+					}
+				default:
+					// The proxy returned a real error (network, timeout,
+					// etc). Match the per-blob path's behaviour where
+					// r.proxy.Contains errors degrade to "treated as
+					// missing" (the underlying boolean is false). Log
+					// each digest as NOT FOUND and let failFast trigger
+					// if the caller wants strict semantics.
+					for _, i := range batchIdx {
+						c.accessLogger.Printf("GRPC CAS HEAD %s NOT FOUND (proxy batch error: %v)", chunk[i].Hash, err)
+					}
+					if failFast {
 						return errMissingBlob
 					}
-					return errRequestCancelled
-				default:
-				}
-
-				wg.Add(1)
-				c.containsQueue <- proxyCheck{
-					wg:     &wg,
-					digest: &chunk[i],
-					ctx:    ctx,
-					// When failFast is true, onProxyMiss will have been set to a function that
-					// will cancel the context, causing the remaining proxyChecks to short-circuit.
-					onProxyMiss: cancelContextForFailFast,
 				}
 			}
 		}
@@ -171,28 +230,38 @@ func filterNonNil(blobs []*pb.Digest) []*pb.Digest {
 
 // Set blobs that exist in the disk cache to nil, and return the number
 // of missing blobs.
-func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
+//
+// The access log is intentionally written AFTER c.mu is released so that
+// access-log I/O latency cannot stall every other RPC waiting on the
+// global cache mutex. The lock-held section now does only in-memory work.
+func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest) int {
 	var key string
 	missing := 0
+
+	// Pre-allocate to avoid growing the slice while the lock is held.
+	hits := make([]string, 0, len(blobs))
+
+	df := cache.DigestFunctionFromContext(ctx)
+	emptyHash := cache.EmptyDigestHash(df)
 
 	c.mu.Lock()
 
 	for i := range blobs {
-		if blobs[i].SizeBytes == 0 && blobs[i].Hash == emptySha256 {
-			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
+		if blobs[i].SizeBytes == 0 && blobs[i].Hash == emptyHash {
+			hits = append(hits, blobs[i].Hash)
 			blobs[i] = nil
 			continue
 		}
 
 		foundSize := int64(-1)
-		key = cache.LookupKey(cache.CAS, blobs[i].Hash)
+		key = cache.LookupKey(cache.CAS, df, blobs[i].Hash)
 		item, listElem := c.lru.Get(key)
 		if listElem != nil {
 			foundSize = item.size
 		}
 
 		if listElem != nil && !isSizeMismatch(blobs[i].SizeBytes, foundSize) {
-			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
+			hits = append(hits, blobs[i].Hash)
 			blobs[i] = nil
 		} else {
 			missing++
@@ -200,6 +269,10 @@ func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
 	}
 
 	c.mu.Unlock()
+
+	for _, h := range hits {
+		c.accessLogger.Printf("GRPC CAS HEAD %s OK", h)
+	}
 
 	return missing
 }
@@ -234,10 +307,24 @@ func (c *diskCache) containsWorker() {
 	}
 }
 
+// Default sizes for the per-blob proxy.Contains worker pool. These are
+// only relevant for proxies that do NOT implement FindMissingCasBlobs;
+// the gRPC proxy collapses the entire fan-out into one batch RPC and
+// therefore never enqueues to containsQueue.
+const (
+	defaultContainsQueueSize = 2048
+	defaultContainsWorkers   = 512
+)
+
 func (c *diskCache) spawnContainsQueueWorkers() {
-	// TODO: make these configurable?
-	const queueSize = 2048
-	const numWorkers = 512
+	queueSize := c.containsQueueSize
+	if queueSize <= 0 {
+		queueSize = defaultContainsQueueSize
+	}
+	numWorkers := c.containsWorkers
+	if numWorkers <= 0 {
+		numWorkers = defaultContainsWorkers
+	}
 
 	c.containsQueue = make(chan proxyCheck, queueSize)
 	for i := 0; i < numWorkers; i++ {

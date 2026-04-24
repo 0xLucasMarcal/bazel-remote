@@ -104,6 +104,10 @@ func (p *testCWProxy) Contains(ctx context.Context, kind cache.EntryKind, hash s
 	return false, -1
 }
 
+func (p *testCWProxy) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
+}
+
 func TestContainsWorker(t *testing.T) {
 	t.Parallel()
 
@@ -182,6 +186,10 @@ func (p *proxyAdapter) Get(ctx context.Context, kind cache.EntryKind, hash strin
 
 func (p *proxyAdapter) Contains(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64) {
 	return p.cache.Contains(ctx, kind, hash, -1)
+}
+
+func (p *proxyAdapter) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
 }
 
 func TestFindMissingCasBlobsWithProxy(t *testing.T) {

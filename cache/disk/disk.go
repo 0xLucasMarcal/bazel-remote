@@ -79,6 +79,11 @@ type diskCache struct {
 	accessLogger     *log.Logger
 	containsQueue    chan proxyCheck
 
+	// Configuration knobs for the per-blob proxy.Contains worker pool.
+	// Read by spawnContainsQueueWorkers; zero values mean "use defaults".
+	containsQueueSize int
+	containsWorkers   int
+
 	// Limit the number of simultaneous file removals and filesystem write
 	// operations (apart from atime updates, which we hope are fast).
 	// When acquiring both the "diskWaitSem" semaphore and the "mu" mutex,
@@ -93,7 +98,6 @@ type diskCache struct {
 }
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
-const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func internalErr(err error) *cache.Error {
 	return &cache.Error{
@@ -145,50 +149,48 @@ func (c *diskCache) pollCacheAge() {
 	}
 }
 
-// Get the idle time of the least-recently used item in the cache, and store the value in a metric
+// Get the idle time of the least-recently used item in the cache, and store the value in a metric.
+//
+// The atime.Stat syscall is intentionally performed AFTER c.mu has been
+// released. Holding the global cache lock across a filesystem syscall
+// would stall every other RPC in the process whenever stat latency
+// spiked (e.g. on a remote/slow volume).
 func (c *diskCache) updateCacheAgeMetric() {
 	c.mu.Lock()
-
 	key, value, ok := c.lru.getTailItem()
 	if !ok {
 		// No items in the cache.
 		c.mu.Unlock()
 		return
 	}
-
-	age := 0.0
-	validAge := true
-
 	f := c.getElementPath(key, value)
-	ts, err := atime.Stat(f)
-
-	if err != nil {
-		log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
-		validAge = false
-	} else {
-		age = time.Since(ts).Seconds()
-	}
-
 	c.mu.Unlock()
 
-	if validAge {
-		c.gaugeCacheAge.Set(age)
+	ts, err := atime.Stat(f)
+	if err != nil {
+		log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
+		return
 	}
+	c.gaugeCacheAge.Set(time.Since(ts).Seconds())
 }
 
 func (c *diskCache) getElementPath(key string, value lruItem) string {
-	ks := key
-	hash := ks[len(ks)-sha256.Size*2:]
-	var kind = cache.AC
-	if strings.HasPrefix(ks, "cas") {
-		kind = cache.CAS
-	} else if strings.HasPrefix(ks, "ac") {
+	kind, df, hash, ok := cache.ParseLookupKey(key)
+	if !ok {
+		// Fall back to the historical decode (kind from prefix, hash
+		// from the last 64 hex chars, default digest function) for
+		// any key that somehow slipped past LookupKey.
+		hash = key[len(key)-sha256.Size*2:]
 		kind = cache.AC
-	} else if strings.HasPrefix(ks, "raw") {
-		kind = cache.RAW
+		switch {
+		case strings.HasPrefix(key, "cas"):
+			kind = cache.CAS
+		case strings.HasPrefix(key, "raw"):
+			kind = cache.RAW
+		}
+		df = cache.DigestFunctionSHA256
 	}
-
-	return filepath.Join(c.dir, c.FileLocation(kind, value.legacy, hash, value.size, value.random))
+	return filepath.Join(c.dir, c.FileLocation(kind, df, value.legacy, hash, value.size, value.random))
 }
 
 func (c *diskCache) removeFile(f string) {
@@ -198,36 +200,60 @@ func (c *diskCache) removeFile(f string) {
 	}
 }
 
-func (c *diskCache) FileLocationBase(kind cache.EntryKind, legacy bool, hash string, size int64) string {
-	if kind == cache.RAW {
-		return path.Join("raw.v2", hash[:2], hash)
+// digestFunctionDir returns the optional path segment inserted between
+// the kind directory (e.g. "cas.v2") and the hash-prefix directory for
+// non-SHA256 digest functions. SHA256 returns the empty string so that
+// existing on-disk caches keep their layout.
+func digestFunctionDir(df cache.DigestFunction) string {
+	if df == cache.DigestFunctionSHA256 {
+		return ""
 	}
-
-	if kind == cache.AC {
-		return path.Join("ac.v2", hash[:2], hash)
-	}
-
-	if legacy {
-		return path.Join("cas.v2", hash[:2], hash)
-	}
-
-	return fmt.Sprintf("cas.v2/%s/%s-%d", hash[:2], hash, size)
+	return df.String()
 }
 
-func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
+func (c *diskCache) FileLocationBase(kind cache.EntryKind, df cache.DigestFunction, legacy bool, hash string, size int64) string {
+	dfDir := digestFunctionDir(df)
+
 	if kind == cache.RAW {
-		return path.Join("raw.v2", hash[:2], hash+"-"+random)
+		return path.Join("raw.v2", dfDir, hash[:2], hash)
 	}
 
 	if kind == cache.AC {
-		return path.Join("ac.v2", hash[:2], hash+"-"+random)
+		return path.Join("ac.v2", dfDir, hash[:2], hash)
 	}
 
 	if legacy {
-		return fmt.Sprintf("cas.v2/%s/%s-%s.v1", hash[:2], hash, random)
+		return path.Join("cas.v2", dfDir, hash[:2], hash)
 	}
 
-	return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
+	if dfDir == "" {
+		return fmt.Sprintf("cas.v2/%s/%s-%d", hash[:2], hash, size)
+	}
+	return fmt.Sprintf("cas.v2/%s/%s/%s-%d", dfDir, hash[:2], hash, size)
+}
+
+func (c *diskCache) FileLocation(kind cache.EntryKind, df cache.DigestFunction, legacy bool, hash string, size int64, random string) string {
+	dfDir := digestFunctionDir(df)
+
+	if kind == cache.RAW {
+		return path.Join("raw.v2", dfDir, hash[:2], hash+"-"+random)
+	}
+
+	if kind == cache.AC {
+		return path.Join("ac.v2", dfDir, hash[:2], hash+"-"+random)
+	}
+
+	if legacy {
+		if dfDir == "" {
+			return fmt.Sprintf("cas.v2/%s/%s-%s.v1", hash[:2], hash, random)
+		}
+		return fmt.Sprintf("cas.v2/%s/%s/%s-%s.v1", dfDir, hash[:2], hash, random)
+	}
+
+	if dfDir == "" {
+		return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
+	}
+	return fmt.Sprintf("cas.v2/%s/%s/%s-%d-%s", dfDir, hash[:2], hash, size, random)
 }
 
 // Put stores a stream of `size` bytes from `r` into the cache.
@@ -255,7 +281,9 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
-	if kind == cache.CAS && size == 0 && hash == emptySha256 {
+	df := cache.DigestFunctionFromContext(ctx)
+
+	if kind == cache.CAS && size == 0 && cache.IsEmptyDigest(df, hash) {
 		return nil
 	}
 
@@ -269,7 +297,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 	defer c.diskWaitSem.Release(1)
 
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKey(kind, df, hash)
 
 	var tf *os.File // Tempfile.
 	var blobFile string
@@ -319,7 +347,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
 	// Final destination, if all goes well.
-	filePath := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, size))
+	filePath := path.Join(c.dir, c.FileLocationBase(kind, df, legacy, hash, size))
 
 	// We will download to this temporary file.
 	tf, random, err := tfc.Create(filePath, legacy)
@@ -456,18 +484,18 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
-func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
+func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, df cache.DigestFunction, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	locked := true
 	var err error
 	c.mu.Lock()
 
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKey(kind, df, hash)
 	item, listElem := c.lru.Get(key)
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
 
-		blobPath := path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
+		blobPath := path.Join(c.dir, c.FileLocation(kind, df, item.legacy, hash, item.size, item.random))
 
 		if !isSizeMismatch(size, item.size) {
 			var f *os.File
@@ -479,7 +507,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 				c.mu.Lock()
 				item, listElem = c.lru.Get(key)
 				if listElem != nil {
-					blobPath = path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
+					blobPath = path.Join(c.dir, c.FileLocation(kind, df, item.legacy, hash, item.size, item.random))
 					f, err = os.Open(blobPath)
 				}
 				c.mu.Unlock()
@@ -595,7 +623,9 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
-	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+	df := cache.DigestFunctionFromContext(ctx)
+
+	if kind == cache.CAS && size <= 0 && cache.IsEmptyDigest(df, hash) {
 		if zstd {
 			return io.NopCloser(bytes.NewReader(emptyZstdBlob)), 0, nil
 		}
@@ -615,7 +645,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 
 	var err error
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKey(kind, df, hash)
 
 	var tf *os.File // Tempfile we will write to.
 	var blobFile string
@@ -651,7 +681,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 	}()
 
-	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, hash, size, offset, zstd)
+	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, df, hash, size, offset, zstd)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -701,7 +731,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
-	blobPathBase := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, foundSize))
+	blobPathBase := path.Join(c.dir, c.FileLocationBase(kind, df, legacy, hash, foundSize))
 	tf, random, err := tfc.Create(blobPathBase, legacy)
 	if err != nil {
 		return nil, -1, internalErr(err)
@@ -716,13 +746,30 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		// like BuildBuddy) or casblob-format data (if backend is another
 		// bazel-remote). Decompress and re-encode in proper casblob format
 		// so the local disk cache can always read it back correctly.
-		dec, decErr := c.zstd.GetDecoder(r)
-		if decErr != nil {
-			_ = tf.Close()
-			return nil, -1, internalErr(decErr)
-		}
-		sizeOnDisk, err = c.writeAndCloseFile(ctx, dec, kind, hash, foundSize, tf)
-		_ = dec.Close()
+		//
+		// The decode is wrapped in a recover() because malformed zstd input
+		// from the proxy has been observed to panic deep inside
+		// klauspost/compress (e.g. "slice bounds out of range [:-1]" in
+		// readerWrapper.readBig). Without the recover, a single bad blob from
+		// the upstream cache crashes the whole process; with it we fail this
+		// one Get and let the existing removeTempfile defer clean up.
+		sizeOnDisk, err = func() (n int64, ferr error) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("recovered panic decoding zstd from proxy for %s/%d: %v", hash, foundSize, rec)
+					ferr = fmt.Errorf("zstd decode panic from proxy stream for %s/%d: %v", hash, foundSize, rec)
+					n = -1
+				}
+			}()
+			dec, decErr := c.zstd.GetDecoder(r)
+			if decErr != nil {
+				_ = tf.Close()
+				return -1, decErr
+			}
+			n, ferr = c.writeAndCloseFile(ctx, dec, kind, hash, foundSize, tf)
+			_ = dec.Close()
+			return n, ferr
+		}()
 	} else {
 		sizeOnDisk, err = io.Copy(tf, r)
 		_ = tf.Close()
@@ -784,12 +831,14 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 		return false, -1
 	}
 
-	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+	df := cache.DigestFunctionFromContext(ctx)
+
+	if kind == cache.CAS && size <= 0 && cache.IsEmptyDigest(df, hash) {
 		return true, 0
 	}
 
 	foundSize := int64(-1)
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKey(kind, df, hash)
 
 	c.mu.Lock()
 	item, listElem := c.lru.Get(key)

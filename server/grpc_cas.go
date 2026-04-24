@@ -76,6 +76,14 @@ func (s *grpcServer) BatchUpdateBlobs(ctx context.Context,
 		return nil, errNilBatchUpdateBlobsRequest
 	}
 
+	if s.batchSem != nil {
+		if err := s.batchSem.Acquire(ctx, 1); err != nil {
+			return nil, grpc_status.Errorf(codes.ResourceExhausted,
+				"BatchUpdateBlobs throttled: %v", err)
+		}
+		defer s.batchSem.Release(1)
+	}
+
 	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(in.DigestFunction))
 
 	resp := pb.BatchUpdateBlobsResponse{
@@ -250,6 +258,14 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 
 	if in == nil {
 		return nil, errNilBatchReadBlobsRequest
+	}
+
+	if s.batchSem != nil {
+		if err := s.batchSem.Acquire(ctx, 1); err != nil {
+			return nil, grpc_status.Errorf(codes.ResourceExhausted,
+				"BatchReadBlobs throttled: %v", err)
+		}
+		defer s.batchSem.Release(1)
 	}
 
 	ctx = cache.WithDigestFunction(ctx, digestFunctionFromProto(in.DigestFunction))

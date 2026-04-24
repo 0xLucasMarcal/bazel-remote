@@ -17,6 +17,8 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"golang.org/x/sync/semaphore"
+
 	asset "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 	"github.com/buchgr/bazel-remote/v2/genproto/build/bazel/semver"
@@ -44,6 +46,13 @@ type grpcServer struct {
 	depsCheck           bool
 	mangleACKeys        bool
 	maxCasBlobSizeBytes int64
+
+	// batchSem caps the number of in-flight BatchReadBlobs and
+	// BatchUpdateBlobs handlers. Each batch handler can buffer all of
+	// its blobs in RAM, so this is the primary memory throttle for
+	// the gRPC CAS surface. nil means "no limit" (preserves the
+	// historical behaviour for callers that don't supply a limit).
+	batchSem *semaphore.Weighted
 }
 
 var readOnlyMethods = map[string]struct{}{
@@ -65,6 +74,7 @@ func ListenAndServeGRPC(
 	mangleACKeys bool,
 	enableRemoteAssetAPI bool,
 	maxCasBlobSizeBytes int64,
+	maxInflightBatchBlobs int,
 	c disk.Cache, a cache.Logger, e cache.Logger) error {
 
 	listener, err := net.Listen(network, addr)
@@ -72,7 +82,7 @@ func ListenAndServeGRPC(
 		return err
 	}
 
-	return ServeGRPC(listener, srv, validateACDeps, mangleACKeys, enableRemoteAssetAPI, maxCasBlobSizeBytes, c, a, e)
+	return ServeGRPC(listener, srv, validateACDeps, mangleACKeys, enableRemoteAssetAPI, maxCasBlobSizeBytes, maxInflightBatchBlobs, c, a, e)
 }
 
 func ServeGRPC(l net.Listener, srv *grpc.Server,
@@ -80,7 +90,13 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 	mangleACKeys bool,
 	enableRemoteAssetAPI bool,
 	maxCasBlobSizeBytes int64,
+	maxInflightBatchBlobs int,
 	c disk.Cache, a cache.Logger, e cache.Logger) error {
+
+	var batchSem *semaphore.Weighted
+	if maxInflightBatchBlobs > 0 {
+		batchSem = semaphore.NewWeighted(int64(maxInflightBatchBlobs))
+	}
 
 	s := &grpcServer{
 		cache:               c,
@@ -89,6 +105,7 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		depsCheck:           validateACDepsCheck,
 		mangleACKeys:        mangleACKeys,
 		maxCasBlobSizeBytes: maxCasBlobSizeBytes,
+		batchSem:            batchSem,
 	}
 	pb.RegisterActionCacheServer(srv, s)
 	pb.RegisterCapabilitiesServer(srv, s)

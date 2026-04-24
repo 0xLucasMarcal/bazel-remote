@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/url"
 	"os"
@@ -130,6 +129,9 @@ type Config struct {
 	LogTimezone                 string                    `yaml:"log_timezone"`
 	MaxBlobSize                 int64                     `yaml:"max_blob_size"`
 	MaxProxyBlobSize            int64                     `yaml:"max_proxy_blob_size"`
+	ProxyContainsQueueSize      int                       `yaml:"proxy_contains_queue_size"`
+	ProxyContainsWorkers        int                       `yaml:"proxy_contains_workers"`
+	MaxInflightBatchBlobs       int                       `yaml:"max_inflight_batch_blobs"`
 
 	// Fields that are created by combinations of the flags above.
 	ProxyBackend cache.Proxy
@@ -153,6 +155,32 @@ type YamlConfig struct {
 }
 
 const disabledGRPCListener = "none"
+
+// Defaults that bound peak memory and goroutine fan-out. Operators that
+// previously relied on the old "essentially unlimited" defaults can opt
+// back in by setting the matching flags or YAML keys explicitly.
+const (
+	// DefaultMaxBlobSize bounds both client uploads and proxy fetches.
+	// Picked at 4 GiB as a safety upper bound that fits any realistic
+	// REAPI artifact while protecting against pathologically large
+	// inputs. Set to math.MaxInt64 (or pass an explicit larger value)
+	// to restore the old behaviour.
+	DefaultMaxBlobSize = int64(4 * 1024 * 1024 * 1024)
+
+	// DefaultProxyContainsQueueSize / DefaultProxyContainsWorkers
+	// control the per-blob proxy.Contains worker pool. These values
+	// only matter for proxies whose FindMissingCasBlobs returns
+	// ErrProxyBatchNotImplemented (HTTP/S3/GCS/AZBlob); the gRPC
+	// proxy batches in a single RPC and never queues here.
+	DefaultProxyContainsQueueSize = 2048
+	DefaultProxyContainsWorkers   = 512
+
+	// DefaultMaxInflightBatchBlobs caps the number of concurrent
+	// BatchReadBlobs / BatchUpdateBlobs gRPC handlers, each of which
+	// can buffer all of its blobs in RAM. This bounds peak server
+	// memory regardless of client concurrency.
+	DefaultMaxInflightBatchBlobs = 64
+)
 
 var defaultDurationBuckets = []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320}
 
@@ -188,7 +216,10 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	logTimezone string,
 	maxSizeHardLimit int,
 	maxBlobSize int64,
-	maxProxyBlobSize int64) (*Config, error) {
+	maxProxyBlobSize int64,
+	proxyContainsQueueSize int,
+	proxyContainsWorkers int,
+	maxInflightBatchBlobs int) (*Config, error) {
 
 	c := Config{
 		HTTPAddress:                 httpAddress,
@@ -227,6 +258,9 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		LogTimezone:                 logTimezone,
 		MaxBlobSize:                 maxBlobSize,
 		MaxProxyBlobSize:            maxProxyBlobSize,
+		ProxyContainsQueueSize:      proxyContainsQueueSize,
+		ProxyContainsWorkers:        proxyContainsWorkers,
+		MaxInflightBatchBlobs:       maxInflightBatchBlobs,
 	}
 
 	err := validateConfig(&c)
@@ -261,9 +295,12 @@ func NewFromYaml(data []byte) (*Config, error) {
 			ZstdImplementation:     "go",
 			NumUploaders:           100,
 			MinTLSVersion:          "1.0",
-			MaxQueuedUploads:       1000000,
-			MaxBlobSize:            math.MaxInt64,
-			MaxProxyBlobSize:       math.MaxInt64,
+			MaxQueuedUploads:       10000,
+			MaxBlobSize:            DefaultMaxBlobSize,
+			MaxProxyBlobSize:       DefaultMaxBlobSize,
+			ProxyContainsQueueSize: DefaultProxyContainsQueueSize,
+			ProxyContainsWorkers:   DefaultProxyContainsWorkers,
+			MaxInflightBatchBlobs:  DefaultMaxInflightBatchBlobs,
 			MetricsDurationBuckets: defaultDurationBuckets,
 			AccessLogLevel:         "all",
 			LogTimezone:            "UTC",
@@ -692,5 +729,8 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Int("max_size_hard_limit"),
 		ctx.Int64("max_blob_size"),
 		ctx.Int64("max_proxy_blob_size"),
+		ctx.Int("proxy_contains_queue_size"),
+		ctx.Int("proxy_contains_workers"),
+		ctx.Int("max_inflight_batch_blobs"),
 	)
 }

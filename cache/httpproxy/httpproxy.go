@@ -243,3 +243,7 @@ func (r *remoteHTTPProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 
 	return false, -1
 }
+
+func (r *remoteHTTPProxyCache) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
+}

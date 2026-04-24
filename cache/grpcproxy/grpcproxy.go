@@ -413,3 +413,44 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		return false, -1
 	}
 }
+
+// FindMissingCasBlobs asks the upstream CAS in a single FindMissingBlobs RPC
+// which of the supplied digests it does not have. This collapses what would
+// otherwise be one RPC per digest into one RPC per call, which is the main
+// fix for findMissingCasBlobsInternal's per-blob fan-out.
+func (r *remoteGrpcProxyCache) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+
+	pbDigests := make([]*pb.Digest, 0, len(digests))
+	for _, d := range digests {
+		pbDigests = append(pbDigests, &pb.Digest{
+			Hash:      d.Hash,
+			SizeBytes: d.SizeBytes,
+		})
+	}
+
+	req := &pb.FindMissingBlobsRequest{
+		DigestFunction: digestFunctionProto(cache.DigestFunctionFromContext(ctx)),
+		BlobDigests:    pbDigests,
+	}
+	res, err := r.clients.cas.FindMissingBlobs(ctx, req)
+	if err != nil {
+		logResponse(r.errorLogger, "FindMissingCasBlobs", err.Error(), cache.CAS, "")
+		return nil, err
+	}
+
+	if len(res.MissingBlobDigests) == 0 {
+		return nil, nil
+	}
+
+	missing := make([]cache.Digest, 0, len(res.MissingBlobDigests))
+	for _, d := range res.MissingBlobDigests {
+		missing = append(missing, cache.Digest{
+			Hash:      d.Hash,
+			SizeBytes: d.SizeBytes,
+		})
+	}
+	return missing, nil
+}

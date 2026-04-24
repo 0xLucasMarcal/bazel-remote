@@ -278,6 +278,10 @@ func (d proxyStub) Contains(ctx context.Context, kind cache.EntryKind, hash stri
 	return true, contentsLength
 }
 
+func (d proxyStub) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
+}
+
 func expectContentEquals(rdr io.ReadCloser, sizeBytes int64, expectedContent []byte) error {
 	if rdr == nil {
 		return fmt.Errorf("expected the item to exist")
@@ -1674,6 +1678,10 @@ func (p fakeProxy) Get(ctx context.Context, kind cache.EntryKind, hash string, s
 func (p fakeProxy) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
 	_, isFound := p.cacheStore.Load(hash)
 	return isFound, size
+}
+
+func (p fakeProxy) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
+	return nil, cache.ErrProxyBatchNotImplemented
 }
 
 // Verifies that proxy downloads for Get operations are throttled to 5000 concurrent operations (3000 on mac).
