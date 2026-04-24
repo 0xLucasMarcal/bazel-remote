@@ -85,7 +85,7 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 			remaining = remaining[batchSize:]
 		}
 
-		numMissing := c.findMissingLocalCAS(ctx, chunk)
+		numMissing := c.findMissingLocalCAS(chunk)
 		if numMissing == 0 {
 			continue
 		}
@@ -234,27 +234,24 @@ func filterNonNil(blobs []*pb.Digest) []*pb.Digest {
 // The access log is intentionally written AFTER c.mu is released so that
 // access-log I/O latency cannot stall every other RPC waiting on the
 // global cache mutex. The lock-held section now does only in-memory work.
-func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest) int {
+func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
 	var key string
 	missing := 0
 
 	// Pre-allocate to avoid growing the slice while the lock is held.
 	hits := make([]string, 0, len(blobs))
 
-	df := cache.DigestFunctionFromContext(ctx)
-	emptyHash := cache.EmptyDigestHash(df)
-
 	c.mu.Lock()
 
 	for i := range blobs {
-		if blobs[i].SizeBytes == 0 && blobs[i].Hash == emptyHash {
+		if blobs[i].SizeBytes == 0 && blobs[i].Hash == emptySha256 {
 			hits = append(hits, blobs[i].Hash)
 			blobs[i] = nil
 			continue
 		}
 
 		foundSize := int64(-1)
-		key = cache.LookupKey(cache.CAS, df, blobs[i].Hash)
+		key = cache.LookupKey(cache.CAS, blobs[i].Hash)
 		item, listElem := c.lru.Get(key)
 		if listElem != nil {
 			foundSize = item.size

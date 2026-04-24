@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"sync"
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
@@ -187,10 +189,22 @@ func (s *grpcServer) validateHash(hash string, size int64, logPrefix string) err
 	return nil
 }
 
+// sawSha256Once fires the first time we see a request that resolves to
+// SHA256 (an explicit DigestFunction_SHA256 or the UNKNOWN default that
+// we map to SHA256). The disk cache currently shares one LRU/disk
+// namespace for SHA256 and BLAKE3, which is safe only while a single
+// digest function is in use. A one-shot log line is enough to flag the
+// day mixed-mode begins; the real fix is to re-enable digest-function
+// key namespacing (see PR3 in the rollout notes).
+var sawSha256Once sync.Once
+
 func digestFunctionFromProto(df pb.DigestFunction_Value) cache.DigestFunction {
 	if df == pb.DigestFunction_BLAKE3 {
 		return cache.DigestFunctionBLAKE3
 	}
+	sawSha256Once.Do(func() {
+		log.Printf("WARNING: first non-BLAKE3 request seen (DigestFunction=%s); cache shares LRU/disk namespace with BLAKE3 entries. If both digest functions will see real traffic, re-enable digest-function key namespacing to prevent collisions.", df)
+	})
 	return cache.DigestFunctionSHA256
 }
 

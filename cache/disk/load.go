@@ -97,27 +97,22 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		}
 	}
 
-	// Create the directory structure. The default (SHA256) namespace
-	// keeps the historical layout (<kind>.v2/<hexpair>); non-default
-	// digest functions get a dedicated subtree
-	// (<kind>.v2/<digestfn>/<hexpair>) so their entries can never
-	// collide with SHA256 entries that share the same hex hash.
+	// Create the directory structure.
 	hexLetters := []byte("0123456789abcdef")
-	dfNamespaces := []string{"", cache.DigestFunctionBLAKE3.String()}
-	kinds := []cache.EntryKind{cache.CAS, cache.AC, cache.RAW}
 	for _, c1 := range hexLetters {
 		for _, c2 := range hexLetters {
 			subDir := string(c1) + string(c2)
-			for _, kind := range kinds {
-				for _, ns := range dfNamespaces {
-					base := filepath.Join(dir, kind.DirName())
-					if ns != "" {
-						base = filepath.Join(base, ns)
-					}
-					if err := os.MkdirAll(filepath.Join(base, subDir), os.ModePerm); err != nil {
-						return nil, err
-					}
-				}
+			err := os.MkdirAll(filepath.Join(dir, cache.CAS.DirName(), subDir), os.ModePerm)
+			if err != nil {
+				return nil, err
+			}
+			err = os.MkdirAll(filepath.Join(dir, cache.AC.DirName(), subDir), os.ModePerm)
+			if err != nil {
+				return nil, err
+			}
+			err = os.MkdirAll(filepath.Join(dir, cache.RAW.DirName(), subDir), os.ModePerm)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -408,41 +403,20 @@ func (c *diskCache) scanDir() (scanResult, error) {
 	// root dir of some unix style filesystems.
 	const lostAndFound = "lost+found"
 
-	// Recognised digest-function subdirectory names; must match
-	// cache.DigestFunction.String() for non-default functions.
-	digestFnDirs := map[string]bool{
-		cache.DigestFunctionBLAKE3.String(): true,
-	}
-
 	for i := 0; i < numWorkers; i++ {
 		dirListers.Go(func() error {
 			for d := range dc {
 				dirName := path.Join(c.dir, d)
 
-				// d is one of:
-				//   "<kind>.v2/<hexpair>"                  (legacy / SHA256)
-				//   "<kind>.v2/<digestfn>/<hexpair>"       (new namespaced)
 				var lookupKeyPrefix string
-				switch {
-				case strings.HasPrefix(d, "cas.v2/"):
+				if strings.HasPrefix(d, "cas.v2/") {
 					lookupKeyPrefix = "cas/"
-				case strings.HasPrefix(d, "ac.v2/"):
+				} else if strings.HasPrefix(d, "ac.v2/") {
 					lookupKeyPrefix = "ac/"
-				case strings.HasPrefix(d, "raw.v2/"):
+				} else if strings.HasPrefix(d, "raw.v2/") {
 					lookupKeyPrefix = "raw/"
-				default:
+				} else {
 					return fmt.Errorf("unrecognised directory in cache dir: %q", dirName)
-				}
-
-				// If this is a namespaced subtree, splice the
-				// digest-function segment into the lookup-key prefix
-				// so the resulting key matches what LookupKey
-				// produces for that function.
-				rest := d[strings.Index(d, "/")+1:]
-				if slash := strings.Index(rest, "/"); slash > 0 {
-					if seg := rest[:slash]; digestFnDirs[seg] {
-						lookupKeyPrefix = lookupKeyPrefix + seg + "/"
-					}
 				}
 
 				des, err := os.ReadDir(dirName)
@@ -565,35 +539,6 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			}
 
 			if name2 == lostAndFound {
-				continue
-			}
-
-			// Namespaced subtree for a non-default digest function
-			// (e.g. cas.v2/blake3/<hexpair>/...). Descend one more
-			// level so the worker pool sees the same per-hexpair
-			// directories as for SHA256.
-			if digestFnDirs[name2] {
-				des3, err := os.ReadDir(path.Join(c.dir, dirPath))
-				if err != nil {
-					return scanResult{}, err
-				}
-				for _, de3 := range des3 {
-					name3 := de3.Name()
-					innerPath := path.Join(dirPath, name3)
-					if !de3.IsDir() {
-						if strings.ToLower(name3) == lowercaseDSStoreFile {
-							continue
-						}
-						return scanResult{}, fmt.Errorf("unexpected file: %s", innerPath)
-					}
-					if name3 == lostAndFound {
-						continue
-					}
-					if !dre.MatchString(name3) {
-						return scanResult{}, fmt.Errorf("unexpected dir: %s", innerPath)
-					}
-					dc <- innerPath
-				}
 				continue
 			}
 

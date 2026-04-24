@@ -98,6 +98,7 @@ type diskCache struct {
 }
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
+const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func internalErr(err error) *cache.Error {
 	return &cache.Error{
@@ -175,22 +176,18 @@ func (c *diskCache) updateCacheAgeMetric() {
 }
 
 func (c *diskCache) getElementPath(key string, value lruItem) string {
-	kind, df, hash, ok := cache.ParseLookupKey(key)
-	if !ok {
-		// Fall back to the historical decode (kind from prefix, hash
-		// from the last 64 hex chars, default digest function) for
-		// any key that somehow slipped past LookupKey.
-		hash = key[len(key)-sha256.Size*2:]
+	ks := key
+	hash := ks[len(ks)-sha256.Size*2:]
+	var kind = cache.AC
+	if strings.HasPrefix(ks, "cas") {
+		kind = cache.CAS
+	} else if strings.HasPrefix(ks, "ac") {
 		kind = cache.AC
-		switch {
-		case strings.HasPrefix(key, "cas"):
-			kind = cache.CAS
-		case strings.HasPrefix(key, "raw"):
-			kind = cache.RAW
-		}
-		df = cache.DigestFunctionSHA256
+	} else if strings.HasPrefix(ks, "raw") {
+		kind = cache.RAW
 	}
-	return filepath.Join(c.dir, c.FileLocation(kind, df, value.legacy, hash, value.size, value.random))
+
+	return filepath.Join(c.dir, c.FileLocation(kind, value.legacy, hash, value.size, value.random))
 }
 
 func (c *diskCache) removeFile(f string) {
@@ -200,60 +197,36 @@ func (c *diskCache) removeFile(f string) {
 	}
 }
 
-// digestFunctionDir returns the optional path segment inserted between
-// the kind directory (e.g. "cas.v2") and the hash-prefix directory for
-// non-SHA256 digest functions. SHA256 returns the empty string so that
-// existing on-disk caches keep their layout.
-func digestFunctionDir(df cache.DigestFunction) string {
-	if df == cache.DigestFunctionSHA256 {
-		return ""
-	}
-	return df.String()
-}
-
-func (c *diskCache) FileLocationBase(kind cache.EntryKind, df cache.DigestFunction, legacy bool, hash string, size int64) string {
-	dfDir := digestFunctionDir(df)
-
+func (c *diskCache) FileLocationBase(kind cache.EntryKind, legacy bool, hash string, size int64) string {
 	if kind == cache.RAW {
-		return path.Join("raw.v2", dfDir, hash[:2], hash)
+		return path.Join("raw.v2", hash[:2], hash)
 	}
 
 	if kind == cache.AC {
-		return path.Join("ac.v2", dfDir, hash[:2], hash)
+		return path.Join("ac.v2", hash[:2], hash)
 	}
 
 	if legacy {
-		return path.Join("cas.v2", dfDir, hash[:2], hash)
+		return path.Join("cas.v2", hash[:2], hash)
 	}
 
-	if dfDir == "" {
-		return fmt.Sprintf("cas.v2/%s/%s-%d", hash[:2], hash, size)
-	}
-	return fmt.Sprintf("cas.v2/%s/%s/%s-%d", dfDir, hash[:2], hash, size)
+	return fmt.Sprintf("cas.v2/%s/%s-%d", hash[:2], hash, size)
 }
 
-func (c *diskCache) FileLocation(kind cache.EntryKind, df cache.DigestFunction, legacy bool, hash string, size int64, random string) string {
-	dfDir := digestFunctionDir(df)
-
+func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
 	if kind == cache.RAW {
-		return path.Join("raw.v2", dfDir, hash[:2], hash+"-"+random)
+		return path.Join("raw.v2", hash[:2], hash+"-"+random)
 	}
 
 	if kind == cache.AC {
-		return path.Join("ac.v2", dfDir, hash[:2], hash+"-"+random)
+		return path.Join("ac.v2", hash[:2], hash+"-"+random)
 	}
 
 	if legacy {
-		if dfDir == "" {
-			return fmt.Sprintf("cas.v2/%s/%s-%s.v1", hash[:2], hash, random)
-		}
-		return fmt.Sprintf("cas.v2/%s/%s/%s-%s.v1", dfDir, hash[:2], hash, random)
+		return fmt.Sprintf("cas.v2/%s/%s-%s.v1", hash[:2], hash, random)
 	}
 
-	if dfDir == "" {
-		return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
-	}
-	return fmt.Sprintf("cas.v2/%s/%s/%s-%d-%s", dfDir, hash[:2], hash, size, random)
+	return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
 }
 
 // Put stores a stream of `size` bytes from `r` into the cache.
@@ -281,9 +254,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
-	df := cache.DigestFunctionFromContext(ctx)
-
-	if kind == cache.CAS && size == 0 && cache.IsEmptyDigest(df, hash) {
+	if kind == cache.CAS && size == 0 && hash == emptySha256 {
 		return nil
 	}
 
@@ -297,7 +268,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 	defer c.diskWaitSem.Release(1)
 
-	key := cache.LookupKey(kind, df, hash)
+	key := cache.LookupKey(kind, hash)
 
 	var tf *os.File // Tempfile.
 	var blobFile string
@@ -347,7 +318,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
 	// Final destination, if all goes well.
-	filePath := path.Join(c.dir, c.FileLocationBase(kind, df, legacy, hash, size))
+	filePath := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, size))
 
 	// We will download to this temporary file.
 	tf, random, err := tfc.Create(filePath, legacy)
@@ -484,18 +455,18 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
-func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, df cache.DigestFunction, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
+func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	locked := true
 	var err error
 	c.mu.Lock()
 
-	key := cache.LookupKey(kind, df, hash)
+	key := cache.LookupKey(kind, hash)
 	item, listElem := c.lru.Get(key)
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
 
-		blobPath := path.Join(c.dir, c.FileLocation(kind, df, item.legacy, hash, item.size, item.random))
+		blobPath := path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
 
 		if !isSizeMismatch(size, item.size) {
 			var f *os.File
@@ -507,7 +478,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, df cache.DigestFun
 				c.mu.Lock()
 				item, listElem = c.lru.Get(key)
 				if listElem != nil {
-					blobPath = path.Join(c.dir, c.FileLocation(kind, df, item.legacy, hash, item.size, item.random))
+					blobPath = path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
 					f, err = os.Open(blobPath)
 				}
 				c.mu.Unlock()
@@ -623,9 +594,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
-	df := cache.DigestFunctionFromContext(ctx)
-
-	if kind == cache.CAS && size <= 0 && cache.IsEmptyDigest(df, hash) {
+	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
 		if zstd {
 			return io.NopCloser(bytes.NewReader(emptyZstdBlob)), 0, nil
 		}
@@ -645,7 +614,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 
 	var err error
-	key := cache.LookupKey(kind, df, hash)
+	key := cache.LookupKey(kind, hash)
 
 	var tf *os.File // Tempfile we will write to.
 	var blobFile string
@@ -681,7 +650,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 	}()
 
-	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, df, hash, size, offset, zstd)
+	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, hash, size, offset, zstd)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -731,7 +700,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
-	blobPathBase := path.Join(c.dir, c.FileLocationBase(kind, df, legacy, hash, foundSize))
+	blobPathBase := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, foundSize))
 	tf, random, err := tfc.Create(blobPathBase, legacy)
 	if err != nil {
 		return nil, -1, internalErr(err)
@@ -831,14 +800,12 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 		return false, -1
 	}
 
-	df := cache.DigestFunctionFromContext(ctx)
-
-	if kind == cache.CAS && size <= 0 && cache.IsEmptyDigest(df, hash) {
+	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
 		return true, 0
 	}
 
 	foundSize := int64(-1)
-	key := cache.LookupKey(kind, df, hash)
+	key := cache.LookupKey(kind, hash)
 
 	c.mu.Lock()
 	item, listElem := c.lru.Get(key)
