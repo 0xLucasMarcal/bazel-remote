@@ -501,7 +501,14 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					return
 				}
 
-				exists, _ := s.cache.Contains(putCtx, cache.CAS, hash, size)
+				// Mark this Contains call as hot-path: a bazel client
+				// is blocked on the inbound CAS Write here, so the
+				// upstream check must use the short hot-path timeout
+				// (and may be short-circuited by the proxy's breaker
+				// when upstream is wedged). Worst case we accept a
+				// redundant upload, which is far better than blocking
+				// the client.
+				exists, _ := s.cache.Contains(cache.WithHotPath(putCtx), cache.CAS, hash, size)
 				if exists {
 					// Blob already exists, return without writing anything.
 					if cmp == casblob.Identity {
@@ -691,8 +698,10 @@ func (s *grpcServer) QueryWriteStatus(ctx context.Context, req *bytestream.Query
 
 	// We don't support partial writes, so the status will either be fully written
 	// and complete, or 0 written and incomplete.
-
-	exists, _ := s.cache.Contains(ctx, cache.CAS, hash, size)
+	//
+	// QueryWriteStatus is also a synchronous bazel-blocking call —
+	// mark hot-path so a wedged upstream doesn't stall it.
+	exists, _ := s.cache.Contains(cache.WithHotPath(ctx), cache.CAS, hash, size)
 
 	if !exists {
 		return &bytestream.QueryWriteStatusResponse{CommittedSize: 0, Complete: false}, nil

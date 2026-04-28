@@ -72,6 +72,12 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	const unknownActionResultSize = -1
 
 	ctx = cache.WithActionDigestSize(ctx, req.ActionDigest.SizeBytes)
+	// GetActionResult is a synchronous bazel-blocking call: any
+	// upstream lookups it triggers (FindMissingCasBlobs validation
+	// inside GetValidatedActionResult, the inline-output Contains
+	// checks in maybeInline, etc.) should use the short hot-path
+	// timeout and may be short-circuited by the upstream breaker.
+	ctx = cache.WithHotPath(ctx)
 
 	if !s.depsCheck {
 		logPrefix = "GRPC AC GET NODEPSCHECK"

@@ -12,6 +12,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -43,10 +44,18 @@ const (
 	// an upstream call).
 	//
 	// The unary timeouts are sized so a momentary upstream hiccup
-	// fails fast rather than blocking a worker for minutes.
+	// fails fast rather than blocking a worker for minutes. These are
+	// the BACKGROUND defaults — synchronous client-blocking callers
+	// should mark their context via cache.WithHotPath to opt into the
+	// much shorter upstreamFindMissingHotTimeout / upstreamContainsHotTimeout.
+	upstreamUpdateACTimeout = 30 * time.Second
+)
+
+// vars (not consts) so tests can override; production defaults
+// unchanged.
+var (
 	upstreamFindMissingTimeout = 10 * time.Second
 	upstreamContainsTimeout    = 10 * time.Second
-	upstreamUpdateACTimeout    = 30 * time.Second
 )
 
 // upstreamWriteIdleTimeout bounds how long a CAS upload to the upstream
@@ -75,6 +84,65 @@ var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_grpc_proxy_uploads_dropped_total",
 	Help: "Number of upstream uploads dropped because the grpc proxy upload queue was full at the time of Put. A non-zero rate indicates the upstream cannot keep up with the local cache's write rate.",
 }, []string{"kind"})
+
+// upstreamCallLatency observes per-call wall-clock latency of upstream
+// RPCs from the grpc proxy. The "method" label is the logical operation
+// (e.g. "Contains", "FindMissingCasBlobs") rather than the wire RPC
+// name, so dashboards can separate hot-path from background work.
+var upstreamCallLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "bazel_remote_grpc_proxy_upstream_call_seconds",
+	Help:    "Wall-clock latency (seconds) of upstream RPCs issued by the grpc proxy.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+}, []string{"method"})
+
+// upstreamCallOutcome counts the disposition of every upstream call.
+// "outcome" values:
+//   - "ok"              : RPC returned without error
+//   - "timeout"         : context deadline exceeded (caller or per-call)
+//   - "canceled"        : context canceled by caller
+//   - "error"           : any other RPC error
+//   - "short_circuited" : the circuit breaker was open and the RPC was
+//                         skipped without a network call
+var upstreamCallOutcome = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpc_proxy_upstream_call_outcomes_total",
+	Help: "Outcome counts for upstream RPCs from the grpc proxy: ok, timeout, canceled, error, short_circuited.",
+}, []string{"method", "outcome"})
+
+// upstreamBreakerStateChanges counts circuit-breaker state transitions
+// so operators can correlate "upstream blip at HH:MM:SS" with breaker
+// activity. The "to" label is the new state ("open"|"half_open"|"closed").
+var upstreamBreakerStateChanges = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpc_proxy_upstream_breaker_transitions_total",
+	Help: "Circuit-breaker state transitions for the grpc proxy upstream. The 'to' label is the new state.",
+}, []string{"to"})
+
+// Hot-path timeouts: when the caller marks ctx via cache.WithHotPath,
+// these (much shorter) deadlines apply instead of upstreamContainsTimeout
+// / upstreamFindMissingTimeout. The intent is that an inbound bazel
+// client call should never wait more than ~1 second on an opportunistic
+// upstream check before bazel-remote answers from local state. Failing
+// closed (treating "no answer" as "blob is missing upstream") is safe
+// here: the worst case is a redundant upload, which is strictly better
+// than blocking the bazel client.
+//
+// vars (not consts) so tests can override.
+var (
+	upstreamContainsHotTimeout    = 1 * time.Second
+	upstreamFindMissingHotTimeout = 1 * time.Second
+)
+
+// Circuit-breaker tuning. When the breaker is "open", Contains and
+// FindMissingCasBlobs return immediately (treating the answer as "all
+// missing") instead of issuing an upstream RPC, so a wedged upstream
+// cannot pin one bazel client per inbound request. After cooldown, a
+// single probe is allowed; success closes the breaker, failure re-opens
+// it.
+//
+// vars (not consts) so tests can override and shrink the cooldown.
+var (
+	upstreamBreakerThreshold = 5
+	upstreamBreakerCooldown  = 5 * time.Second
+)
 
 type GrpcClients struct {
 	asset asset.FetchClient
@@ -133,6 +201,13 @@ type remoteGrpcProxyCache struct {
 	// overlapping clients) cause duplicate fan-out under a slow
 	// upstream.
 	findMissingSF singleflight.Group
+
+	// breaker short-circuits client-blocking upstream RPCs when the
+	// upstream has been failing recently, so a wedged upstream cannot
+	// translate one-for-one into bazel client latency. Only the
+	// synchronous client paths (Contains/FindMissingCasBlobs) consult
+	// it; async uploads use the idle watchdog instead.
+	breaker *circuitBreaker
 }
 
 func digestFunctionProto(df cache.DigestFunction) pb.DigestFunction_Value {
@@ -158,6 +233,7 @@ func New(clients *GrpcClients, storageMode string,
 		accessLogger: accessLogger,
 		errorLogger:  errorLogger,
 		v2mode:       storageMode == "zstd",
+		breaker:      newCircuitBreaker(upstreamBreakerThreshold, upstreamBreakerCooldown),
 	}
 
 	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
@@ -462,6 +538,15 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 			return true, digest.SizeBytes
 		}
 
+		// Synchronous client-blocking call: consult the breaker first
+		// so a wedged upstream short-circuits to "missing" instead of
+		// blocking the inbound bazel request for the full per-call
+		// timeout.
+		if !r.breaker.Allow() {
+			upstreamCallOutcome.WithLabelValues("Contains", "short_circuited").Inc()
+			return false, -1
+		}
+
 		req := &pb.FindMissingBlobsRequest{
 			DigestFunction: digestFunctionProto(cache.DigestFunctionFromContext(ctx)),
 			BlobDigests: []*pb.Digest{{
@@ -469,13 +554,23 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 				SizeBytes: size,
 			}},
 		}
-		containsCtx, cancel := context.WithTimeout(ctx, upstreamContainsTimeout)
+		timeout := upstreamContainsTimeout
+		if cache.IsHotPath(ctx) {
+			timeout = upstreamContainsHotTimeout
+		}
+		containsCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		start := time.Now()
 		res, err := r.clients.cas.FindMissingBlobs(containsCtx, req)
+		upstreamCallLatency.WithLabelValues("Contains").Observe(time.Since(start).Seconds())
 		if err != nil {
+			r.breaker.RecordFailure()
+			upstreamCallOutcome.WithLabelValues("Contains", classifyOutcome(err)).Inc()
 			logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
 			return false, -1
 		}
+		r.breaker.RecordSuccess()
+		upstreamCallOutcome.WithLabelValues("Contains", "ok").Inc()
 		for range res.MissingBlobDigests {
 			return false, -1
 		}
@@ -513,6 +608,17 @@ func (r *remoteGrpcProxyCache) FindMissingCasBlobs(ctx context.Context, digests 
 }
 
 func (r *remoteGrpcProxyCache) findMissingCasBlobsUpstream(ctx context.Context, df pb.DigestFunction_Value, digests []cache.Digest) ([]cache.Digest, error) {
+	// Short-circuit when the breaker is open: report ALL digests as
+	// missing. This is the safe fallback — bazel will treat them as
+	// cache misses and re-upload, which is far less harmful than
+	// blocking every inbound RPC for upstreamFindMissingTimeout.
+	if !r.breaker.Allow() {
+		upstreamCallOutcome.WithLabelValues("FindMissingCasBlobs", "short_circuited").Inc()
+		out := make([]cache.Digest, len(digests))
+		copy(out, digests)
+		return out, nil
+	}
+
 	pbDigests := make([]*pb.Digest, 0, len(digests))
 	for _, d := range digests {
 		pbDigests = append(pbDigests, &pb.Digest{
@@ -526,13 +632,23 @@ func (r *remoteGrpcProxyCache) findMissingCasBlobsUpstream(ctx context.Context, 
 		BlobDigests:    pbDigests,
 	}
 
-	fmbCtx, cancel := context.WithTimeout(ctx, upstreamFindMissingTimeout)
+	timeout := upstreamFindMissingTimeout
+	if cache.IsHotPath(ctx) {
+		timeout = upstreamFindMissingHotTimeout
+	}
+	fmbCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	start := time.Now()
 	res, err := r.clients.cas.FindMissingBlobs(fmbCtx, req)
+	upstreamCallLatency.WithLabelValues("FindMissingCasBlobs").Observe(time.Since(start).Seconds())
 	if err != nil {
+		r.breaker.RecordFailure()
+		upstreamCallOutcome.WithLabelValues("FindMissingCasBlobs", classifyOutcome(err)).Inc()
 		logResponse(r.errorLogger, "FindMissingCasBlobs", err.Error(), cache.CAS, "")
 		return nil, err
 	}
+	r.breaker.RecordSuccess()
+	upstreamCallOutcome.WithLabelValues("FindMissingCasBlobs", "ok").Inc()
 
 	if len(res.MissingBlobDigests) == 0 {
 		return nil, nil
@@ -572,4 +688,138 @@ func findMissingSingleflightKey(df pb.DigestFunction_Value, digests []cache.Dige
 		_, _ = h.Write(sizeBuf[:])
 	}
 	return string(h.Sum(nil))
+}
+
+// classifyOutcome maps an error from an upstream RPC into the value
+// used by the upstreamCallOutcome metric.
+func classifyOutcome(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return "canceled"
+	}
+	return "error"
+}
+
+// circuitBreakerState is the lifecycle state of an upstream circuit
+// breaker. The valid transitions are:
+//
+//	closed   --threshold consecutive failures--> open
+//	open     --cooldown elapsed--> half_open
+//	half_open --probe success--> closed
+//	half_open --probe failure--> open
+type circuitBreakerState int
+
+const (
+	cbClosed circuitBreakerState = iota
+	cbOpen
+	cbHalfOpen
+)
+
+func (s circuitBreakerState) String() string {
+	switch s {
+	case cbClosed:
+		return "closed"
+	case cbOpen:
+		return "open"
+	case cbHalfOpen:
+		return "half_open"
+	}
+	return "unknown"
+}
+
+// circuitBreaker is a small three-state breaker used to stop the grpc
+// proxy from issuing client-blocking upstream RPCs when the upstream
+// has been failing recently. It is intentionally simple — no rolling
+// window, no per-method state — because its only job is to keep an
+// unhealthy upstream from translating one-for-one into bazel client
+// latency. Allow/RecordSuccess/RecordFailure are safe for concurrent
+// use.
+type circuitBreaker struct {
+	mu             sync.Mutex
+	state          circuitBreakerState
+	consecutiveErr int
+	openedAt       time.Time
+	threshold      int
+	cooldown       time.Duration
+}
+
+func newCircuitBreaker(threshold int, cooldown time.Duration) *circuitBreaker {
+	return &circuitBreaker{
+		threshold: threshold,
+		cooldown:  cooldown,
+	}
+}
+
+// Allow reports whether a new upstream RPC may proceed. When in the
+// open state and the cooldown has elapsed, Allow transitions the
+// breaker to half_open and grants the calling goroutine the single
+// in-flight probe; concurrent callers see Allow=false until the probe
+// completes via RecordSuccess (closes) or RecordFailure (re-opens).
+func (cb *circuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case cbClosed:
+		return true
+	case cbOpen:
+		if time.Since(cb.openedAt) >= cb.cooldown {
+			cb.transitionLocked(cbHalfOpen)
+			return true
+		}
+		return false
+	case cbHalfOpen:
+		return false
+	}
+	return true
+}
+
+func (cb *circuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.consecutiveErr = 0
+	if cb.state != cbClosed {
+		cb.transitionLocked(cbClosed)
+	}
+}
+
+func (cb *circuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.consecutiveErr++
+	switch cb.state {
+	case cbHalfOpen:
+		// Probe failed; re-open and restart the cooldown.
+		cb.openedAt = time.Now()
+		cb.transitionLocked(cbOpen)
+	case cbClosed:
+		if cb.consecutiveErr >= cb.threshold {
+			cb.openedAt = time.Now()
+			cb.transitionLocked(cbOpen)
+		}
+	case cbOpen:
+		// Stay open; refresh openedAt so cooldown is measured from
+		// the most recent observed failure.
+		cb.openedAt = time.Now()
+	}
+}
+
+// State returns the current breaker state. Intended for tests and
+// occasional diagnostic logging only.
+func (cb *circuitBreaker) State() circuitBreakerState {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state
+}
+
+func (cb *circuitBreaker) transitionLocked(to circuitBreakerState) {
+	if cb.state == to {
+		return
+	}
+	cb.state = to
+	upstreamBreakerStateChanges.WithLabelValues(to.String()).Inc()
 }

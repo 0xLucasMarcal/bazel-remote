@@ -61,7 +61,10 @@ func (s *grpcServer) FindMissingBlobs(ctx context.Context,
 		}
 	}
 
-	missingBlobs, err := s.cache.FindMissingCasBlobs(ctx, req.BlobDigests)
+	// Inbound bazel FindMissingBlobs is a tight client-blocking call;
+	// mark hot-path so the upstream RPC fans out under the short
+	// hot-path timeout and respects the upstream breaker.
+	missingBlobs, err := s.cache.FindMissingCasBlobs(cache.WithHotPath(ctx), req.BlobDigests)
 	if err != nil {
 		return nil, err
 	}
@@ -551,7 +554,8 @@ func (s *grpcServer) SpliceBlob(ctx context.Context, req *pb.SpliceBlobRequest) 
 			chunkTotal, req.BlobDigest.SizeBytes)
 	}
 
-	alreadyHaveSplicedBlob, _ := s.cache.Contains(ctx, cache.CAS, req.BlobDigest.Hash, req.BlobDigest.SizeBytes)
+	// SpliceBlob is also a synchronous bazel-blocking call - hot-path.
+	alreadyHaveSplicedBlob, _ := s.cache.Contains(cache.WithHotPath(ctx), cache.CAS, req.BlobDigest.Hash, req.BlobDigest.SizeBytes)
 	if alreadyHaveSplicedBlob {
 		resp := pb.SpliceBlobResponse{
 			BlobDigest: req.BlobDigest,

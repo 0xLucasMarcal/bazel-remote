@@ -28,6 +28,7 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "breaker_hotpath_test.go",
         "grpcproxy_test.go",
         "timeout_singleflight_test.go",
         "upload_idle_timeout_test.go",

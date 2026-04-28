@@ -28,6 +28,28 @@ type contextKey string
 
 const actionDigestSizeKey contextKey = "actionDigestSize"
 const digestFunctionKey contextKey = "digestFunction"
+const hotPathKey contextKey = "hotPath"
+
+// WithHotPath marks ctx as belonging to a "hot" client-blocking call
+// path — i.e. a request where a bazel client is synchronously waiting
+// on bazel-remote's response. Proxy implementations may use this hint
+// to apply tighter per-RPC timeouts and/or short-circuit when a circuit
+// breaker is open, so a wedged upstream cannot translate one-for-one
+// into client-visible latency.
+//
+// Background paths (e.g. the upload uploaders, admin endpoints, or any
+// call where bazel itself is not waiting in real time) should NOT mark
+// the context — they will then continue to use the more generous
+// background timeouts that prefer correctness over latency.
+func WithHotPath(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hotPathKey, true)
+}
+
+// IsHotPath reports whether ctx was marked via WithHotPath.
+func IsHotPath(ctx context.Context) bool {
+	v, _ := ctx.Value(hotPathKey).(bool)
+	return v
+}
 
 type DigestFunction int
 
