@@ -3,16 +3,21 @@ package grpcproxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,7 +32,34 @@ const (
 	// The maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
+
+	// Upper bounds for upstream RPCs. These prevent a slow or wedged
+	// upstream proxy from indefinitely tying up upload workers and
+	// FindMissingBlobs callers (which is the typical root cause of
+	// client-side "uploading missing input" stalls observed via
+	// goroutine dumps where every in-flight request is parked on
+	// an upstream call).
+	//
+	// The unary timeouts are sized so a momentary upstream hiccup
+	// fails fast rather than blocking a worker for minutes.
+	upstreamFindMissingTimeout = 10 * time.Second
+	upstreamContainsTimeout    = 10 * time.Second
+	upstreamUpdateACTimeout    = 30 * time.Second
 )
+
+// upstreamWriteIdleTimeout bounds how long a CAS upload to the upstream
+// may make no forward progress before we give up. We deliberately do not
+// impose an end-to-end deadline on the Write stream: the upstream is a
+// shared, throttled resource (observed as low as ~1 Mbps under fleet
+// pressure), and a fixed total deadline would kill legitimate large-blob
+// uploads and amplify load via retries. An idle timeout instead
+// distinguishes "wedged" from "slow but progressing" — every successful
+// Send resets the timer, so a 1 Mbps trickle survives, but a stream that
+// stops accepting bytes is aborted within this window.
+//
+// Declared as a var (not a const) so tests can shrink it without
+// extending their wall-clock runtime to 60s+.
+var upstreamWriteIdleTimeout = 60 * time.Second
 
 type GrpcClients struct {
 	asset asset.FetchClient
@@ -79,6 +111,13 @@ type remoteGrpcProxyCache struct {
 	accessLogger cache.Logger
 	errorLogger  cache.Logger
 	v2mode       bool
+
+	// findMissingSF collapses concurrent FindMissingCasBlobs requests
+	// for an identical digest set into a single in-flight upstream RPC.
+	// This is most useful when retries from the same client (or
+	// overlapping clients) cause duplicate fan-out under a slow
+	// upstream.
+	findMissingSF singleflight.Group
 }
 
 func digestFunctionProto(df cache.DigestFunction) pb.DigestFunction_Value {
@@ -156,13 +195,23 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 			ActionResult:   ar,
 			DigestFunction: digestFunctionProto(item.DigestFunction),
 		}
-		_, err = r.clients.ac.UpdateActionResult(context.Background(), req)
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), upstreamUpdateACTimeout)
+		defer updateCancel()
+		_, err = r.clients.ac.UpdateActionResult(updateCtx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
 		}
 		return
 	case cache.CAS:
-		stream, err := r.clients.bs.Write(context.Background())
+		writeCtx, writeCancel := context.WithCancel(context.Background())
+		defer writeCancel()
+		// Idle watchdog: cancel the stream if no successful Send
+		// (or CloseAndRecv) happens within upstreamWriteIdleTimeout.
+		// Reset on every observed forward progress below.
+		idleTimer := time.AfterFunc(upstreamWriteIdleTimeout, writeCancel)
+		defer idleTimer.Stop()
+
+		stream, err := r.clients.bs.Write(writeCtx)
 		if err != nil {
 			logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 			return
@@ -215,6 +264,7 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 					// Server closed the stream early. The real error (or a
 					// short-circuit success for a blob that already exists)
 					// is in CloseAndRecv.
+					idleTimer.Reset(upstreamWriteIdleTimeout)
 					_, recvErr := stream.CloseAndRecv()
 					if recvErr != nil {
 						logResponse(r.errorLogger, "Write", recvErr.Error(), item.Kind, item.Hash)
@@ -225,6 +275,9 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 					return
 				}
+				// Successful Send is the proof of forward progress
+				// against the upstream; refresh the idle deadline.
+				idleTimer.Reset(upstreamWriteIdleTimeout)
 			}
 
 			if finished {
@@ -399,7 +452,9 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 				SizeBytes: size,
 			}},
 		}
-		res, err := r.clients.cas.FindMissingBlobs(ctx, req)
+		containsCtx, cancel := context.WithTimeout(ctx, upstreamContainsTimeout)
+		defer cancel()
+		res, err := r.clients.cas.FindMissingBlobs(containsCtx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
 			return false, -1
@@ -418,11 +473,29 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 // which of the supplied digests it does not have. This collapses what would
 // otherwise be one RPC per digest into one RPC per call, which is the main
 // fix for findMissingCasBlobsInternal's per-blob fan-out.
+//
+// The upstream call is bounded by upstreamFindMissingTimeout so that a slow
+// or wedged upstream cannot indefinitely tie up callers. Concurrent calls
+// for an identical digest set are collapsed via singleflight to avoid
+// amplifying load on an already-struggling upstream.
 func (r *remoteGrpcProxyCache) FindMissingCasBlobs(ctx context.Context, digests []cache.Digest) ([]cache.Digest, error) {
 	if len(digests) == 0 {
 		return nil, nil
 	}
 
+	df := digestFunctionProto(cache.DigestFunctionFromContext(ctx))
+	key := findMissingSingleflightKey(df, digests)
+
+	v, err, _ := r.findMissingSF.Do(key, func() (any, error) {
+		return r.findMissingCasBlobsUpstream(ctx, df, digests)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]cache.Digest), nil
+}
+
+func (r *remoteGrpcProxyCache) findMissingCasBlobsUpstream(ctx context.Context, df pb.DigestFunction_Value, digests []cache.Digest) ([]cache.Digest, error) {
 	pbDigests := make([]*pb.Digest, 0, len(digests))
 	for _, d := range digests {
 		pbDigests = append(pbDigests, &pb.Digest{
@@ -432,10 +505,13 @@ func (r *remoteGrpcProxyCache) FindMissingCasBlobs(ctx context.Context, digests 
 	}
 
 	req := &pb.FindMissingBlobsRequest{
-		DigestFunction: digestFunctionProto(cache.DigestFunctionFromContext(ctx)),
+		DigestFunction: df,
 		BlobDigests:    pbDigests,
 	}
-	res, err := r.clients.cas.FindMissingBlobs(ctx, req)
+
+	fmbCtx, cancel := context.WithTimeout(ctx, upstreamFindMissingTimeout)
+	defer cancel()
+	res, err := r.clients.cas.FindMissingBlobs(fmbCtx, req)
 	if err != nil {
 		logResponse(r.errorLogger, "FindMissingCasBlobs", err.Error(), cache.CAS, "")
 		return nil, err
@@ -453,4 +529,30 @@ func (r *remoteGrpcProxyCache) FindMissingCasBlobs(ctx context.Context, digests 
 		})
 	}
 	return missing, nil
+}
+
+// findMissingSingleflightKey returns a stable, deterministic key for a
+// (digestFunction, digestSet) pair. The digest order is normalised so
+// that callers asking the same question in different orders share one
+// upstream RPC.
+func findMissingSingleflightKey(df pb.DigestFunction_Value, digests []cache.Digest) string {
+	sorted := make([]cache.Digest, len(digests))
+	copy(sorted, digests)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Hash != sorted[j].Hash {
+			return sorted[i].Hash < sorted[j].Hash
+		}
+		return sorted[i].SizeBytes < sorted[j].SizeBytes
+	})
+
+	h := sha256.New()
+	var sizeBuf [8]byte
+	binary.LittleEndian.PutUint32(sizeBuf[:4], uint32(df))
+	_, _ = h.Write(sizeBuf[:4])
+	for _, d := range sorted {
+		_, _ = h.Write([]byte(d.Hash))
+		binary.LittleEndian.PutUint64(sizeBuf[:], uint64(d.SizeBytes))
+		_, _ = h.Write(sizeBuf[:])
+	}
+	return string(h.Sum(nil))
 }
