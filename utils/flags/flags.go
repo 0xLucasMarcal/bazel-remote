@@ -222,6 +222,12 @@ func GetCliFlags() []cli.Flag {
 			Usage:   "Maximum number of concurrent BatchReadBlobs / BatchUpdateBlobs gRPC handlers. Each handler can buffer its blobs in RAM, so this is the primary knob for bounding peak server memory. Increase if you have plenty of RAM and want to serve more parallel batch requests.",
 			EnvVars: []string{"BAZEL_REMOTE_MAX_INFLIGHT_BATCH_BLOBS"},
 		},
+		&cli.BoolFlag{
+			Name:    "disk_drop_page_cache_after_read",
+			Value:   false,
+			Usage:   "If true, call posix_fadvise(POSIX_FADV_DONTNEED) on each cache blob after it has been streamed to a client, hinting the kernel to drop its page-cache pages. Useful when running under a cgroup memory limit (e.g. Kubernetes) where page cache counts toward container_memory_working_set_bytes. Trade-off: hot blobs will be re-read from disk instead of served from page cache. Linux only; no-op elsewhere.",
+			EnvVars: []string{"BAZEL_REMOTE_DISK_DROP_PAGE_CACHE_AFTER_READ"},
+		},
 		&cli.StringFlag{
 			Name:    "grpc_proxy.url",
 			Value:   "",

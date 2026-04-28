@@ -132,6 +132,7 @@ type Config struct {
 	ProxyContainsQueueSize      int                       `yaml:"proxy_contains_queue_size"`
 	ProxyContainsWorkers        int                       `yaml:"proxy_contains_workers"`
 	MaxInflightBatchBlobs       int                       `yaml:"max_inflight_batch_blobs"`
+	DiskDropPageCacheAfterRead  bool                      `yaml:"disk_drop_page_cache_after_read"`
 
 	// Fields that are created by combinations of the flags above.
 	ProxyBackend cache.Proxy
@@ -219,7 +220,8 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	maxProxyBlobSize int64,
 	proxyContainsQueueSize int,
 	proxyContainsWorkers int,
-	maxInflightBatchBlobs int) (*Config, error) {
+	maxInflightBatchBlobs int,
+	diskDropPageCacheAfterRead bool) (*Config, error) {
 
 	c := Config{
 		HTTPAddress:                 httpAddress,
@@ -261,6 +263,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		ProxyContainsQueueSize:      proxyContainsQueueSize,
 		ProxyContainsWorkers:        proxyContainsWorkers,
 		MaxInflightBatchBlobs:       maxInflightBatchBlobs,
+		DiskDropPageCacheAfterRead:  diskDropPageCacheAfterRead,
 	}
 
 	err := validateConfig(&c)
@@ -732,5 +735,6 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Int("proxy_contains_queue_size"),
 		ctx.Int("proxy_contains_workers"),
 		ctx.Int("max_inflight_batch_blobs"),
+		ctx.Bool("disk_drop_page_cache_after_read"),
 	)
 }

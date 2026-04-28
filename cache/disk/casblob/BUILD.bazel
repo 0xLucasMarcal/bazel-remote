@@ -2,10 +2,19 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
-    srcs = ["casblob.go"],
+    srcs = [
+        "casblob.go",
+        "fadvise_linux.go",
+        "fadvise_other.go",
+    ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache/disk/casblob",
     visibility = ["//visibility:public"],
-    deps = ["//cache/disk/zstdimpl:go_default_library"],
+    deps = ["//cache/disk/zstdimpl:go_default_library"] + select({
+        "@io_bazel_rules_go//go/platform:linux": [
+            "@org_golang_x_sys//unix:go_default_library",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 go_test(

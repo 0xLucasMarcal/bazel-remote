@@ -343,12 +343,12 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	r = nil // We read all the data from r.
 
 	if c.proxy != nil {
-		rc, err := os.Open(blobFile)
+		f, err := os.Open(blobFile)
 		if err != nil {
 			log.Println("Failed to proxy Put:", err)
 		} else {
 			// Doesn't block, should be fast.
-			c.proxy.Put(ctx, kind, hash, size, sizeOnDisk, rc)
+			c.proxy.Put(ctx, kind, hash, size, sizeOnDisk, casblob.WrapFileForRead(f))
 		}
 	}
 
@@ -531,7 +531,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 						blobPath, size, foundSize)
 				} else {
 					_, err = f.Seek(offset, io.SeekStart)
-					return f, foundSize, false, err
+					return casblob.WrapFileForRead(f), foundSize, false, err
 				}
 			}
 		}
@@ -764,7 +764,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		if zstd {
 			rc, err = casblob.GetLegacyZstdReadCloser(c.zstd, rcf)
 		} else {
-			rc = rcf
+			rc = casblob.WrapFileForRead(rcf)
 		}
 	} else { // Compressed CAS blob.
 		if zstd {

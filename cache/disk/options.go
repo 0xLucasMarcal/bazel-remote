@@ -139,3 +139,24 @@ func WithMaxSizeHardLimit(maxSizeHardLimit int64) Option {
 		return nil
 	}
 }
+
+// WithDropPageCacheAfterRead controls whether bazel-remote asks the
+// kernel to drop the page-cache pages backing each cache blob right
+// after the blob has been streamed to the client (via
+// posix_fadvise(POSIX_FADV_DONTNEED)). Useful when the process runs
+// under a cgroup memory limit (e.g. Kubernetes), where page cache is
+// counted toward container_memory_working_set_bytes and can drive OOM
+// kills even though the Go heap is small.
+//
+// Trade-off: dropping pages defeats the page cache for repeated reads
+// of the same blob, so latency on hot blobs may increase if the
+// underlying storage is slow. Enable when bound by container memory,
+// leave off when bound by read latency.
+//
+// No-op on non-Linux platforms.
+func WithDropPageCacheAfterRead(enabled bool) Option {
+	return func(c *CacheConfig) error {
+		casblob.SetDropPageCacheOnClose(enabled)
+		return nil
+	}
+}

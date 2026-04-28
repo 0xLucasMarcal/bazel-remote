@@ -78,6 +78,34 @@ type readCloserWrapper struct {
 	file *os.File
 }
 
+// fileReadCloser wraps a bare *os.File so that, when callers Close() it,
+// we get a chance to advise the kernel to drop the file's page-cache
+// pages before the file descriptor is closed. Used on read paths that
+// would otherwise return *os.File directly.
+type fileReadCloser struct {
+	*os.File
+}
+
+func (f *fileReadCloser) Close() error {
+	dropPageCache(f.File)
+	return f.File.Close()
+}
+
+// wrapFileForRead wraps f so that on Close() the kernel is asked to drop
+// the file's page-cache pages before the descriptor is closed. Used on
+// read paths that would otherwise return *os.File directly.
+func wrapFileForRead(f *os.File) io.ReadCloser {
+	return &fileReadCloser{File: f}
+}
+
+// WrapFileForRead is the exported counterpart of wrapFileForRead, used by
+// callers outside this package (e.g. the disk cache's Action Cache and
+// proxy-upload read paths) that hold a bare *os.File and want the same
+// page-cache eviction behaviour at Close() time.
+func WrapFileForRead(f *os.File) io.ReadCloser {
+	return wrapFileForRead(f)
+}
+
 var ErrWrongMagicNum = errors.New("expected magic number not found")
 
 // Read the header and leave f at the start of the data.
@@ -241,7 +269,7 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 			}
 		}
 
-		return f, nil
+		return wrapFileForRead(f), nil
 	}
 
 	if h.compression != Zstandard {
@@ -293,6 +321,7 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 	if chunkNum == int64(len(h.chunkOffsets)-2) {
 		// Last chunk in the file.
 		r := bytes.NewReader(uncompressedFirstChunk[remainder:])
+		dropPageCache(f)
 		_ = f.Close()
 		return io.NopCloser(r), nil
 	}
@@ -363,7 +392,7 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 			return nil, fmt.Errorf("failed to seek to start of file: %w", err)
 		}
 
-		return f, nil
+		return wrapFileForRead(f), nil
 	}
 
 	// Find the first relevant chunk.
@@ -380,7 +409,7 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 
 	if remainder == 0 {
 		// Simple case- just stream the file from here.
-		return f, nil
+		return wrapFileForRead(f), nil
 	}
 
 	compressedFirstChunk := make([]byte, h.chunkOffsets[chunkNum+1]-h.chunkOffsets[chunkNum])
@@ -401,6 +430,7 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 
 	br := bytes.NewReader(recompressedChunk)
 	if chunkNum == int64(len(h.chunkOffsets)-2) {
+		dropPageCache(f)
 		_ = f.Close()
 		return io.NopCloser(br), nil
 	}
@@ -442,6 +472,7 @@ func GetLegacyZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser,
 			_ = pw.CloseWithError(err)
 		}
 
+		dropPageCache(f)
 		err = f.Close()
 		if err != nil {
 			log.Println("Error while closing file:", err)
@@ -507,6 +538,7 @@ func (b *readCloserWrapper) Close() error {
 	f := b.file
 	b.file = nil
 
+	dropPageCache(f)
 	return f.Close()
 }
 

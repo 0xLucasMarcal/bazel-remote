@@ -153,6 +153,7 @@ func run(ctx *cli.Context) error {
 		disk.WithMaxSizeHardLimit(int64(c.MaxSizeHardLimit) * 1024 * 1024 * 1024),
 		disk.WithAccessLogger(c.AccessLogger),
 		disk.WithProxyContainsQueue(c.ProxyContainsQueueSize, c.ProxyContainsWorkers),
+		disk.WithDropPageCacheAfterRead(c.DiskDropPageCacheAfterRead),
 	}
 	if c.ProxyBackend != nil {
 		opts = append(opts, disk.WithProxyBackend(c.ProxyBackend))
