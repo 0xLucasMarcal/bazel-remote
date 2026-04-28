@@ -17,6 +17,8 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -60,6 +62,19 @@ const (
 // Declared as a var (not a const) so tests can shrink it without
 // extending their wall-clock runtime to 60s+.
 var upstreamWriteIdleTimeout = 60 * time.Second
+
+// uploadsDropped counts asynchronous upstream uploads that were dropped
+// because the upload queue was full at Put-time. A non-zero rate is the
+// canonical signal that the upstream proxy cannot keep up with the
+// local cache's write rate (e.g. a multi-instance fleet sharing one
+// throttled upstream): the blob is still served from the local cache,
+// but it will not be re-pushed to the upstream by this Put. Use the
+// per-kind label to distinguish CAS uploads (the typical bottleneck)
+// from AC/RAW.
+var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpc_proxy_uploads_dropped_total",
+	Help: "Number of upstream uploads dropped because the grpc proxy upload queue was full at the time of Put. A non-zero rate indicates the upstream cannot keep up with the local cache's write rate.",
+}, []string{"kind"})
 
 type GrpcClients struct {
 	asset asset.FetchClient
@@ -313,7 +328,9 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 	select {
 	case r.uploadQueue <- item:
 	default:
-		r.errorLogger.Printf("too many uploads queued")
+		uploadsDropped.WithLabelValues(kind.String()).Inc()
+		r.errorLogger.Printf("GRPC PROXY: dropped upload %s %s (size=%d): upload queue full (capacity=%d) - upstream is not keeping up",
+			strings.ToUpper(kind.String()), hash, logicalSize, cap(r.uploadQueue))
 		_ = rc.Close()
 	}
 }
